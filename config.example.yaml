@@ -110,9 +110,9 @@ macros:
 # - when empty (the default) authorization will not be checked as llama-swap is default-allow
 # - each key is a non-empty string
 apiKeys:
-  - "sk-hunter2"
+  - "example-api-key-1"
   # tip, one liner: printf "sk-%s\n" "$(head -c 48 /dev/urandom | base64 )"
-  - "sk-gyCPiKUcIfPlaM4OSMZekkprgijPx6+OsmQs8Rsg0xZ9qpy6gKWsIKqHOk+cgXVx"
+  - "example-api-key-2"
 
   # use environment variable macros to keep secrets out of the config
   - "${env.API_KEY_1}"

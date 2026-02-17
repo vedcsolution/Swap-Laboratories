@@ -166,10 +166,10 @@ includeAliasesInList: false
 # - when empty (the default) authorization will not be checked as llama-swap is default-allow
 # - each key is a non-empty string
 apiKeys:
-  - "sk-hunter2"
+  - "example-api-key-1"
   # hint, one liner: printf "sk-%s\n" "$(head -c 48 /dev/urandom | base64 )"
-  - "sk-gyCPiKUcIfPlaM4OSMZekkprgijPx6+OsmQs8Rsg0xZ9qpy6gKWsIKqHOk+cgXVx"
-  - "sk-+QtIn0Zjj4UHjiaZYiZEnru4mrwKM9RzhmJeK5SobNXLl8QMFXxGz1/2lEuvQpkb"
+  - "example-api-key-2"
+  - "example-api-key-3"
 
 # macros: a dictionary of string substitutions
 # - optional, default: empty dictionary

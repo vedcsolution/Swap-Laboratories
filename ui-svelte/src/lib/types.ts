@@ -51,7 +51,7 @@ export interface VersionInfo {
 
 export type ScreenWidth = "xs" | "sm" | "md" | "lg" | "xl" | "2xl";
 
-export type BenchyJobStatus = "running" | "done" | "error" | "canceled";
+export type BenchyJobStatus = "scheduled" | "running" | "done" | "error" | "canceled";
 
 export type BenchyIntelligencePlugin =
   | "all"
@@ -89,6 +89,7 @@ export interface BenchyStartOptions {
   datasetCacheDir?: string;
   outputDir?: string;
   maxConcurrent?: number;
+  startAt?: string;
 }
 
 export interface BenchyJob {
@@ -117,6 +118,7 @@ export interface BenchyJob {
   datasetCacheDir?: string;
   outputDir?: string;
   maxConcurrent?: number;
+  scheduledAt?: string;
   status: BenchyJobStatus;
   startedAt: string;
   finishedAt?: string;
@@ -168,14 +170,42 @@ export interface RecipeUIState {
 }
 
 export type RecipeBackendSource = "override" | "env" | "default";
+export type RecipeBackendKind = "vllm" | "sqlang" | "trtllm" | "custom";
+
+export type RecipeBackendAction =
+  | "git_pull"
+  | "git_pull_rebase"
+  | "build_vllm"
+  | "build_mxfp4"
+  | "build_trtllm_image"
+  | "update_trtllm_image";
+
+export interface RecipeBackendActionInfo {
+  action: RecipeBackendAction | string;
+  label: string;
+  commandHint?: string;
+}
+
+export interface RecipeBackendTRTLLMImage {
+  selected: string;
+  default: string;
+  latest?: string;
+  updateAvailable?: boolean;
+  available?: string[];
+  warning?: string;
+}
 
 export interface RecipeBackendState {
   backendDir: string;
   backendSource: RecipeBackendSource;
   options: string[];
+  backendKind: RecipeBackendKind;
+  backendVendor?: string;
+  deploymentGuideUrl?: string;
+  repoUrl?: string;
+  actions: RecipeBackendActionInfo[];
+  trtllmImage?: RecipeBackendTRTLLMImage;
 }
-
-export type RecipeBackendAction = "git_pull" | "git_pull_rebase" | "build_vllm" | "build_mxfp4";
 
 export interface RecipeBackendActionResponse {
   action: RecipeBackendAction | string;

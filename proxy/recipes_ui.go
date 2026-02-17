@@ -3,8 +3,10 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -26,11 +28,15 @@ const (
 	recipesBackendDirEnv           = "LLAMA_SWAP_RECIPES_BACKEND_DIR"
 	recipesBackendOverrideFileEnv  = "LLAMA_SWAP_RECIPES_BACKEND_OVERRIDE_FILE"
 	recipesLocalDirEnv             = "LLAMA_SWAP_LOCAL_RECIPES_DIR"
+	trtllmSourceImageOverrideFile  = ".llama-swap-trtllm-source-image"
 	defaultRecipesBackendSubdir    = "spark-vllm-docker"
 	defaultRecipesBackendAltSubdir = "spark-trtllm-docker"
 	defaultRecipesBackendSQLSubdir = "spark-sqlang-docker"
 	defaultRecipesLocalSubdir      = "llama-swap/recipes"
 	defaultRecipeGroupName         = "managed-recipes"
+	defaultTRTLLMImageTag          = "trtllm-node"
+	defaultTRTLLMSourceImage       = "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3"
+	trtllmDeploymentGuideURL       = "https://build.nvidia.com/spark/trt-llm/stacked-sparks"
 	recipeMetadataKey              = "recipe_ui"
 	recipeMetadataManagedField     = "managed"
 )
@@ -39,6 +45,8 @@ var (
 	recipeRunnerRe           = regexp.MustCompile(`(?:^|\s)(?:exec\s+)?(?:\$\{recipe_runner\}|[^\s'"]*run-recipe\.sh)\s+([^\s'"]+)`)
 	recipeTpRe               = regexp.MustCompile(`(?:^|\s)--tp\s+([0-9]+)`)
 	recipeNodesRe            = regexp.MustCompile(`(?:^|\s)-n\s+("?[^"\s]+"?|\$\{[^}]+\}|[^\s]+)`)
+	trtllmSourceImageRe      = regexp.MustCompile(`(?m)^SOURCE_IMAGE="([^"]+)"`)
+	trtllmTagVersionRe       = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?:rc(\d+))?(?:\.post(\d+))?$`)
 	recipesBackendOverrideMu sync.RWMutex
 	recipesBackendOverride   string
 )
@@ -90,9 +98,30 @@ type RecipeUIState struct {
 }
 
 type RecipeBackendState struct {
-	BackendDir    string   `json:"backendDir"`
-	BackendSource string   `json:"backendSource"`
-	Options       []string `json:"options"`
+	BackendDir         string                    `json:"backendDir"`
+	BackendSource      string                    `json:"backendSource"`
+	Options            []string                  `json:"options"`
+	BackendKind        string                    `json:"backendKind"`
+	BackendVendor      string                    `json:"backendVendor,omitempty"`
+	DeploymentGuideURL string                    `json:"deploymentGuideUrl,omitempty"`
+	RepoURL            string                    `json:"repoUrl,omitempty"`
+	Actions            []RecipeBackendActionInfo `json:"actions"`
+	TRTLLMImage        *RecipeBackendTRTLLMImage `json:"trtllmImage,omitempty"`
+}
+
+type RecipeBackendActionInfo struct {
+	Action      string `json:"action"`
+	Label       string `json:"label"`
+	CommandHint string `json:"commandHint,omitempty"`
+}
+
+type RecipeBackendTRTLLMImage struct {
+	Selected        string   `json:"selected"`
+	Default         string   `json:"default"`
+	Latest          string   `json:"latest,omitempty"`
+	UpdateAvailable bool     `json:"updateAvailable,omitempty"`
+	Available       []string `json:"available,omitempty"`
+	Warning         string   `json:"warning,omitempty"`
 }
 
 type upsertRecipeModelRequest struct {
@@ -116,7 +145,8 @@ type setRecipeBackendRequest struct {
 }
 
 type recipeBackendActionRequest struct {
-	Action string `json:"action"`
+	Action      string `json:"action"`
+	SourceImage string `json:"sourceImage,omitempty"`
 }
 
 type recipeBackendActionResponse struct {
@@ -127,8 +157,6 @@ type recipeBackendActionResponse struct {
 	Output     string `json:"output,omitempty"`
 	DurationMs int64  `json:"durationMs"`
 }
-
-const sparkVLLMUpstreamRepo = "https://github.com/eugr/spark-vllm-docker"
 
 func (pm *ProxyManager) apiGetRecipeState(c *gin.Context) {
 	state, err := pm.buildRecipeUIState()
@@ -150,6 +178,7 @@ func (pm *ProxyManager) apiSetRecipeBackend(c *gin.Context) {
 		return
 	}
 
+	previousKind := detectRecipeBackendKind(recipesBackendDir())
 	desired := expandLeadingTilde(strings.TrimSpace(req.BackendDir))
 	if desired != "" {
 		abs, err := filepath.Abs(desired)
@@ -175,6 +204,31 @@ func (pm *ProxyManager) apiSetRecipeBackend(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
+	nextKind := detectRecipeBackendKind(recipesBackendDir())
+	if err := pm.switchRecipeBackendConfig(previousKind, nextKind); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := pm.syncRecipeBackendMacros(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := pm.persistActiveConfigForBackend(nextKind); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if nextKind == "trtllm" {
+		backendDir := strings.TrimSpace(recipesBackendDir())
+		if backendDir != "" {
+			image := resolveTRTLLMSourceImage(backendDir, "")
+			if err := persistTRTLLMSourceImage(backendDir, image); err != nil {
+				pm.proxyLogger.Warnf("failed to persist trtllm source image override dir=%s err=%v", backendDir, err)
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, pm.recipeBackendState())
 }
 
@@ -196,26 +250,37 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 		return
 	}
 
+	backendKind := detectRecipeBackendKind(backendDir)
+	hasGit := backendHasGitRepo(backendDir)
+	hasBuildScript := backendHasBuildScript(backendDir)
+
 	var cmd *exec.Cmd
 	var commandText string
+	var trtllmSourceImage string
+	var previousTRTLLMSourceImage string
+
 	switch action {
 	case "git_pull":
-		commandText = "git pull --ff-only " + sparkVLLMUpstreamRepo + " main"
-		cmd = exec.CommandContext(
-			c.Request.Context(),
-			"git", "-C", backendDir, "pull", "--ff-only",
-			sparkVLLMUpstreamRepo, "main",
-		)
+		if !hasGit {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "git actions are not available for this backend"})
+			return
+		}
+		commandText = "git pull --ff-only"
+		cmd = exec.CommandContext(c.Request.Context(), "git", "-C", backendDir, "pull", "--ff-only")
 	case "git_pull_rebase":
-		commandText = "git pull --rebase --autostash " + sparkVLLMUpstreamRepo + " main"
-		cmd = exec.CommandContext(
-			c.Request.Context(),
-			"git", "-C", backendDir, "pull", "--rebase", "--autostash",
-			sparkVLLMUpstreamRepo, "main",
-		)
+		if !hasGit {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "git actions are not available for this backend"})
+			return
+		}
+		commandText = "git pull --rebase --autostash"
+		cmd = exec.CommandContext(c.Request.Context(), "git", "-C", backendDir, "pull", "--rebase", "--autostash")
 	case "build_vllm":
-		script := filepath.Join(backendDir, "build-and-copy.sh")
-		if _, err := os.Stat(script); err != nil {
+		if backendKind == "trtllm" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "build_vllm is not supported for TRT-LLM backend"})
+			return
+		}
+		if !hasBuildScript {
+			script := filepath.Join(backendDir, "build-and-copy.sh")
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("build script not found: %s", script)})
 			return
 		}
@@ -225,8 +290,12 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 		cmd = exec.CommandContext(ctx, "bash", "./build-and-copy.sh", "--rebuild-deps", "--rebuild-vllm", "-c")
 		cmd.Dir = backendDir
 	case "build_mxfp4":
-		script := filepath.Join(backendDir, "build-and-copy.sh")
-		if _, err := os.Stat(script); err != nil {
+		if backendKind == "trtllm" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "build_mxfp4 is not supported for TRT-LLM backend"})
+			return
+		}
+		if !hasBuildScript {
+			script := filepath.Join(backendDir, "build-and-copy.sh")
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("build script not found: %s", script)})
 			return
 		}
@@ -244,6 +313,62 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 			"-c",
 		)
 		cmd.Dir = backendDir
+	case "build_trtllm_image":
+		if backendKind != "trtllm" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "build_trtllm_image is only supported for TRT-LLM backend"})
+			return
+		}
+		if !hasBuildScript {
+			script := filepath.Join(backendDir, "build-and-copy.sh")
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("build script not found: %s", script)})
+			return
+		}
+		trtllmSourceImage = resolveTRTLLMSourceImage(backendDir, req.SourceImage)
+		if trtllmSourceImage == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "source image is empty"})
+			return
+		}
+		commandText = fmt.Sprintf("./build-and-copy.sh -t %s --source-image %s -c", defaultTRTLLMImageTag, trtllmSourceImage)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Hour)
+		defer cancel()
+		cmd = exec.CommandContext(
+			ctx,
+			"bash",
+			"./build-and-copy.sh",
+			"-t", defaultTRTLLMImageTag,
+			"--source-image", trtllmSourceImage,
+			"-c",
+		)
+		cmd.Dir = backendDir
+	case "update_trtllm_image":
+		if backendKind != "trtllm" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "update_trtllm_image is only supported for TRT-LLM backend"})
+			return
+		}
+		if !hasBuildScript {
+			script := filepath.Join(backendDir, "build-and-copy.sh")
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("build script not found: %s", script)})
+			return
+		}
+		previousTRTLLMSourceImage = resolveTRTLLMSourceImage(backendDir, "")
+		trtllmSourceImage = resolveTRTLLMSourceImage(backendDir, req.SourceImage)
+		if trtllmSourceImage == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "source image is empty"})
+			return
+		}
+		commandText = fmt.Sprintf(
+			"bash -lc \"./build-and-copy.sh -t %s --source-image $NEW_IMAGE -c; cleanup old image on local+peer nodes\"",
+			defaultTRTLLMImageTag,
+		)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Hour)
+		defer cancel()
+		cmd = exec.CommandContext(ctx, "bash", "-lc", trtllmUpdateScript(defaultTRTLLMImageTag))
+		cmd.Dir = backendDir
+		cmd.Env = append(
+			os.Environ(),
+			"NEW_IMAGE="+trtllmSourceImage,
+			"OLD_IMAGE="+previousTRTLLMSourceImage,
+		)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported action"})
 		return
@@ -273,6 +398,10 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 			"durationMs": durationMs,
 		})
 		return
+	}
+
+	if action == "build_trtllm_image" || action == "update_trtllm_image" {
+		_ = persistTRTLLMSourceImage(backendDir, trtllmSourceImage)
 	}
 
 	pm.proxyLogger.Infof("backend action completed action=%s dir=%s durationMs=%d", action, backendDir, durationMs)
@@ -363,11 +492,25 @@ func (pm *ProxyManager) recipeBackendState() RecipeBackendState {
 	options := recommendedRecipesBackendOptions()
 	options = appendUniquePath(options, current)
 	sort.Strings(options)
-	return RecipeBackendState{
+
+	kind := detectRecipeBackendKind(current)
+	repoURL := backendGitRemoteOrigin(current)
+	actions := recipeBackendActionsForKind(kind, current, repoURL)
+
+	state := RecipeBackendState{
 		BackendDir:    current,
 		BackendSource: source,
 		Options:       options,
+		BackendKind:   kind,
+		BackendVendor: recipeBackendVendor(kind),
+		RepoURL:       repoURL,
+		Actions:       actions,
 	}
+	if kind == "trtllm" {
+		state.TRTLLMImage = buildTRTLLMImageState(current)
+		state.DeploymentGuideURL = trtllmDeploymentGuideURL
+	}
+	return state
 }
 
 func (pm *ProxyManager) upsertRecipeModel(req upsertRecipeModelRequest) (RecipeUIState, error) {
@@ -432,10 +575,10 @@ func (pm *ProxyManager) upsertRecipeModel(req upsertRecipeModelRequest) (RecipeU
 
 	nodes := strings.TrimSpace(req.Nodes)
 	if mode == "cluster" && nodes == "" {
-		if hasMacro(root, "vllm_nodes") {
-			nodes = "${vllm_nodes}"
+		if expr, ok := backendMacroExpr(root, "nodes"); ok {
+			nodes = expr
 		} else {
-			return RecipeUIState{}, errors.New("nodes is required for cluster mode (macro vllm_nodes not found)")
+			return RecipeUIState{}, errors.New("nodes is required for cluster mode (backend nodes macro not found)")
 		}
 	}
 
@@ -471,9 +614,9 @@ func (pm *ProxyManager) upsertRecipeModel(req upsertRecipeModelRequest) (RecipeU
 
 	cmdStopExpr := "true"
 	stopPrefix := ""
-	if hasMacro(root, "vllm_stop_cluster") {
-		cmdStopExpr = "${vllm_stop_cluster}"
-		stopPrefix = "${vllm_stop_cluster}; "
+	if expr, ok := backendMacroExpr(root, "stop_cluster"); ok {
+		cmdStopExpr = expr
+		stopPrefix = expr + "; "
 	}
 
 	runner := filepath.Join(recipesBackendDir(), "run-recipe.sh")
@@ -649,6 +792,443 @@ func recommendedRecipesBackendOptions() []string {
 	return uniqueExistingDirs(options)
 }
 
+func detectRecipeBackendKind(backendDir string) string {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(backendDir)))
+	switch {
+	case strings.Contains(base, "trtllm"):
+		return "trtllm"
+	case strings.Contains(base, "sqlang"):
+		return "sqlang"
+	case strings.Contains(base, "vllm"):
+		return "vllm"
+	default:
+		return "custom"
+	}
+}
+
+func backendHasGitRepo(backendDir string) bool {
+	if backendDir == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(backendDir, ".git")); err == nil {
+		return true
+	}
+	return false
+}
+
+func backendHasBuildScript(backendDir string) bool {
+	if backendDir == "" {
+		return false
+	}
+	if stat, err := os.Stat(filepath.Join(backendDir, "build-and-copy.sh")); err == nil {
+		return !stat.IsDir()
+	}
+	return false
+}
+
+func backendGitRemoteOrigin(backendDir string) string {
+	if !backendHasGitRepo(backendDir) {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", backendDir, "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func shortRepoLabel(repoURL string) string {
+	repoURL = strings.TrimSpace(repoURL)
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	repoURL = strings.TrimPrefix(repoURL, "git@github.com:")
+	repoURL = strings.TrimPrefix(repoURL, "https://github.com/")
+	parts := strings.Split(repoURL, "/")
+	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0] + "/" + parts[1]
+	}
+	if repoURL == "" {
+		return "origin"
+	}
+	return repoURL
+}
+
+func recipeBackendVendor(kind string) string {
+	if strings.EqualFold(strings.TrimSpace(kind), "trtllm") {
+		return "nvidia"
+	}
+	return ""
+}
+
+func recipeBackendActionsForKind(kind, backendDir, repoURL string) []RecipeBackendActionInfo {
+	actions := make([]RecipeBackendActionInfo, 0, 4)
+	if backendHasGitRepo(backendDir) {
+		repoLabel := shortRepoLabel(repoURL)
+		actions = append(actions,
+			RecipeBackendActionInfo{Action: "git_pull", Label: fmt.Sprintf("Git Pull (%s)", repoLabel), CommandHint: "git pull --ff-only"},
+			RecipeBackendActionInfo{Action: "git_pull_rebase", Label: fmt.Sprintf("Git Pull Rebase (%s)", repoLabel), CommandHint: "git pull --rebase --autostash"},
+		)
+	}
+
+	if !backendHasBuildScript(backendDir) {
+		return actions
+	}
+
+	if kind == "trtllm" {
+		actions = append(actions,
+			RecipeBackendActionInfo{
+				Action:      "update_trtllm_image",
+				Label:       "Update TRT-LLM Image",
+				CommandHint: "./build-and-copy.sh -t trtllm-node --source-image <selected> -c + cleanup previous source image on peer nodes",
+			},
+		)
+		return actions
+	}
+
+	actions = append(actions,
+		RecipeBackendActionInfo{Action: "build_vllm", Label: "Build vLLM", CommandHint: "./build-and-copy.sh --rebuild-deps --rebuild-vllm -c"},
+		RecipeBackendActionInfo{Action: "build_mxfp4", Label: "Build MXFP4", CommandHint: "./build-and-copy.sh -t vllm-node-mxfp4 --rebuild-deps --rebuild-vllm --exp-mxfp4 -c"},
+	)
+	return actions
+}
+
+func trtllmSourceImageOverridePath(backendDir string) string {
+	if strings.TrimSpace(backendDir) == "" {
+		return ""
+	}
+	return filepath.Join(backendDir, trtllmSourceImageOverrideFile)
+}
+
+func loadTRTLLMSourceImage(backendDir string) string {
+	override := trtllmSourceImageOverridePath(backendDir)
+	if override != "" {
+		if raw, err := os.ReadFile(override); err == nil {
+			if v := strings.TrimSpace(string(raw)); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func persistTRTLLMSourceImage(backendDir, image string) error {
+	override := trtllmSourceImageOverridePath(backendDir)
+	if override == "" {
+		return nil
+	}
+	image = strings.TrimSpace(image)
+	if image == "" {
+		if err := os.Remove(override); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	tmp := override + ".tmp"
+	if err := os.WriteFile(tmp, []byte(image+"\n"), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, override)
+}
+
+func readDefaultTRTLLMSourceImage(backendDir string) string {
+	if envImage := strings.TrimSpace(os.Getenv("LLAMA_SWAP_TRTLLM_SOURCE_IMAGE")); envImage != "" {
+		return envImage
+	}
+	scriptPath := filepath.Join(strings.TrimSpace(backendDir), "build-and-copy.sh")
+	raw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		return defaultTRTLLMSourceImage
+	}
+	m := trtllmSourceImageRe.FindStringSubmatch(string(raw))
+	if len(m) > 1 {
+		if v := strings.TrimSpace(m[1]); v != "" {
+			return v
+		}
+	}
+	return defaultTRTLLMSourceImage
+}
+
+func resolveTRTLLMSourceImage(backendDir, requested string) string {
+	if v := strings.TrimSpace(requested); v != "" {
+		return v
+	}
+	if v := loadTRTLLMSourceImage(backendDir); v != "" {
+		return v
+	}
+	return readDefaultTRTLLMSourceImage(backendDir)
+}
+
+func trtllmUpdateScript(imageTag string) string {
+	imageTag = strings.TrimSpace(imageTag)
+	if imageTag == "" {
+		imageTag = defaultTRTLLMImageTag
+	}
+
+	return fmt.Sprintf(`set -euo pipefail
+
+./build-and-copy.sh -t %s --source-image "${NEW_IMAGE}" -c
+
+if [[ -z "${OLD_IMAGE:-}" || "${OLD_IMAGE}" == "${NEW_IMAGE}" ]]; then
+  echo "No old TRT-LLM source image to remove."
+  exit 0
+fi
+
+echo "Removing old TRT-LLM source image locally: ${OLD_IMAGE}"
+docker image rm -f "${OLD_IMAGE}" || true
+
+declare -a PEER_NODES=()
+if [[ -f "./autodiscover.sh" ]]; then
+  source "./autodiscover.sh" || true
+  detect_nodes >/dev/null 2>&1 || true
+fi
+
+if [[ ${#PEER_NODES[@]} -eq 0 ]]; then
+  echo "No peer nodes detected for old image cleanup."
+  exit 0
+fi
+
+for host in "${PEER_NODES[@]}"; do
+  [[ -n "${host}" ]] || continue
+  echo "Removing old TRT-LLM source image on ${host}: ${OLD_IMAGE}"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "${USER}@${host}" "docker image rm -f \"${OLD_IMAGE}\" || true" || true
+done
+`, quoteForCommand(imageTag))
+}
+
+type nvcrProxyAuthResponse struct {
+	Token string `json:"token"`
+}
+
+type nvcrTagsResponse struct {
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
+}
+
+func fetchTRTLLMReleaseTags(ctx context.Context) ([]string, error) {
+	authReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://nvcr.io/proxy_auth?scope=repository:nvidia/tensorrt-llm/release:pull", nil)
+	if err != nil {
+		return nil, err
+	}
+	authResp, err := http.DefaultClient.Do(authReq)
+	if err != nil {
+		return nil, err
+	}
+	defer authResp.Body.Close()
+	if authResp.StatusCode < 200 || authResp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(authResp.Body, 2048))
+		return nil, fmt.Errorf("nvcr auth failed: %s %s", authResp.Status, strings.TrimSpace(string(body)))
+	}
+	var auth nvcrProxyAuthResponse
+	if err := json.NewDecoder(authResp.Body).Decode(&auth); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(auth.Token) == "" {
+		return nil, errors.New("nvcr auth returned empty token")
+	}
+
+	tagsReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://nvcr.io/v2/nvidia/tensorrt-llm/release/tags/list?n=2000", nil)
+	if err != nil {
+		return nil, err
+	}
+	tagsReq.Header.Set("Authorization", "Bearer "+auth.Token)
+
+	tagsResp, err := http.DefaultClient.Do(tagsReq)
+	if err != nil {
+		return nil, err
+	}
+	defer tagsResp.Body.Close()
+	if tagsResp.StatusCode < 200 || tagsResp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(tagsResp.Body, 2048))
+		return nil, fmt.Errorf("nvcr tags failed: %s %s", tagsResp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var payload nvcrTagsResponse
+	if err := json.NewDecoder(tagsResp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return payload.Tags, nil
+}
+
+type trtllmTagVersion struct {
+	Major int
+	Minor int
+	Patch int
+	RC    *int
+	Post  int
+	Raw   string
+}
+
+func parseTRTLLMTagVersion(tag string) (trtllmTagVersion, bool) {
+	tag = strings.TrimSpace(tag)
+	m := trtllmTagVersionRe.FindStringSubmatch(tag)
+	if len(m) == 0 {
+		return trtllmTagVersion{}, false
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	patch, _ := strconv.Atoi(m[3])
+	var rcPtr *int
+	if m[4] != "" {
+		rc, _ := strconv.Atoi(m[4])
+		rcPtr = &rc
+	}
+	post := 0
+	if m[5] != "" {
+		post, _ = strconv.Atoi(m[5])
+	}
+	return trtllmTagVersion{Major: major, Minor: minor, Patch: patch, RC: rcPtr, Post: post, Raw: tag}, true
+}
+
+func compareTRTLLMTagVersion(a, b trtllmTagVersion) int {
+	if a.Major != b.Major {
+		if a.Major < b.Major {
+			return -1
+		}
+		return 1
+	}
+	if a.Minor != b.Minor {
+		if a.Minor < b.Minor {
+			return -1
+		}
+		return 1
+	}
+	if a.Patch != b.Patch {
+		if a.Patch < b.Patch {
+			return -1
+		}
+		return 1
+	}
+
+	if a.RC != nil && b.RC == nil {
+		return -1
+	}
+	if a.RC == nil && b.RC != nil {
+		return 1
+	}
+	if a.RC != nil && b.RC != nil {
+		if *a.RC < *b.RC {
+			return -1
+		}
+		if *a.RC > *b.RC {
+			return 1
+		}
+	}
+	if a.Post != b.Post {
+		if a.Post < b.Post {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+func latestTRTLLMTag(tags []string) string {
+	var best trtllmTagVersion
+	hasBest := false
+	for _, tag := range tags {
+		v, ok := parseTRTLLMTagVersion(tag)
+		if !ok {
+			continue
+		}
+		if !hasBest || compareTRTLLMTagVersion(v, best) > 0 {
+			best = v
+			hasBest = true
+		}
+	}
+	if !hasBest {
+		return ""
+	}
+	return best.Raw
+}
+
+func topTRTLLMTags(tags []string, limit int) []string {
+	versions := make([]trtllmTagVersion, 0, len(tags))
+	for _, tag := range tags {
+		v, ok := parseTRTLLMTagVersion(tag)
+		if ok {
+			versions = append(versions, v)
+		}
+	}
+	sort.Slice(versions, func(i, j int) bool {
+		return compareTRTLLMTagVersion(versions[i], versions[j]) > 0
+	})
+	if limit <= 0 || len(versions) < limit {
+		limit = len(versions)
+	}
+	out := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		out = append(out, versions[i].Raw)
+	}
+	return out
+}
+
+func tagFromImageRef(image string) string {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(image, ":"); idx >= 0 && idx < len(image)-1 {
+		return image[idx+1:]
+	}
+	return ""
+}
+
+func appendUniqueString(items []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return items
+	}
+	for _, item := range items {
+		if item == value {
+			return items
+		}
+	}
+	return append(items, value)
+}
+
+func buildTRTLLMImageState(backendDir string) *RecipeBackendTRTLLMImage {
+	defaultImage := readDefaultTRTLLMSourceImage(backendDir)
+	selectedImage := resolveTRTLLMSourceImage(backendDir, "")
+	if selectedImage == "" {
+		selectedImage = defaultImage
+	}
+	state := &RecipeBackendTRTLLMImage{
+		Selected: selectedImage,
+		Default:  defaultImage,
+	}
+	state.Available = appendUniqueString(state.Available, selectedImage)
+	state.Available = appendUniqueString(state.Available, defaultImage)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	tags, err := fetchTRTLLMReleaseTags(ctx)
+	if err != nil {
+		state.Warning = fmt.Sprintf("No se pudieron consultar tags de nvcr.io: %v", err)
+		return state
+	}
+
+	latestTag := latestTRTLLMTag(tags)
+	if latestTag != "" {
+		latestImage := "nvcr.io/nvidia/tensorrt-llm/release:" + latestTag
+		state.Latest = latestImage
+		state.Available = appendUniqueString(state.Available, latestImage)
+
+		selectedTag := tagFromImageRef(selectedImage)
+		selectedVersion, selectedOK := parseTRTLLMTagVersion(selectedTag)
+		latestVersion, latestOK := parseTRTLLMTagVersion(latestTag)
+		if selectedOK && latestOK && compareTRTLLMTagVersion(selectedVersion, latestVersion) < 0 {
+			state.UpdateAvailable = true
+		}
+	}
+
+	for _, tag := range topTRTLLMTags(tags, 12) {
+		state.Available = appendUniqueString(state.Available, "nvcr.io/nvidia/tensorrt-llm/release:"+tag)
+	}
+	return state
+}
+
 func uniqueExistingDirs(paths []string) []string {
 	seen := make(map[string]struct{}, len(paths))
 	out := make([]string, 0, len(paths))
@@ -757,6 +1337,113 @@ func (pm *ProxyManager) getConfigPath() (string, error) {
 		return v, nil
 	}
 	return "", errors.New("config path is unknown (start llama-swap with --config)")
+}
+
+func normalizeBackendConfigKind(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "vllm", "trtllm", "sqlang":
+		return strings.ToLower(strings.TrimSpace(kind))
+	default:
+		return "custom"
+	}
+}
+
+func backendScopedConfigPath(configPath, backendKind string) string {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return ""
+	}
+	ext := filepath.Ext(configPath)
+	if ext == "" {
+		ext = ".yaml"
+	}
+	base := strings.TrimSuffix(filepath.Base(configPath), ext)
+	kind := normalizeBackendConfigKind(backendKind)
+	return filepath.Join(filepath.Dir(configPath), fmt.Sprintf("%s.%s%s", base, kind, ext))
+}
+
+func copyFileAtomic(src, dst string) error {
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(dst)
+	if parent != "" {
+		if err := os.MkdirAll(parent, 0755); err != nil {
+			return err
+		}
+	}
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+func (pm *ProxyManager) switchRecipeBackendConfig(previousKind, nextKind string) error {
+	configPath, err := pm.getConfigPath()
+	if err != nil {
+		return err
+	}
+
+	prevPath := backendScopedConfigPath(configPath, previousKind)
+	nextPath := backendScopedConfigPath(configPath, nextKind)
+
+	if prevPath != "" {
+		if err := copyFileAtomic(configPath, prevPath); err != nil {
+			return fmt.Errorf("failed to persist %s backend config: %w", normalizeBackendConfigKind(previousKind), err)
+		}
+	}
+
+	if nextPath != "" && nextPath != prevPath {
+		if _, err := os.Stat(nextPath); err == nil {
+			if err := copyFileAtomic(nextPath, configPath); err != nil {
+				return fmt.Errorf("failed to load %s backend config: %w", normalizeBackendConfigKind(nextKind), err)
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("failed to inspect %s backend config: %w", normalizeBackendConfigKind(nextKind), err)
+		}
+	}
+
+	return nil
+}
+
+func (pm *ProxyManager) persistActiveConfigForBackend(kind string) error {
+	configPath, err := pm.getConfigPath()
+	if err != nil {
+		return err
+	}
+	scopedPath := backendScopedConfigPath(configPath, kind)
+	if scopedPath == "" {
+		return nil
+	}
+	if err := copyFileAtomic(configPath, scopedPath); err != nil {
+		return fmt.Errorf("failed to persist active %s backend config: %w", normalizeBackendConfigKind(kind), err)
+	}
+	return nil
+}
+
+func (pm *ProxyManager) syncRecipeBackendMacros() error {
+	configPath, err := pm.getConfigPath()
+	if err != nil {
+		return err
+	}
+
+	root, err := loadConfigRawMap(configPath)
+	if err != nil {
+		return err
+	}
+	ensureRecipeMacros(root, configPath)
+	if err := writeConfigRawMap(configPath, root); err != nil {
+		return err
+	}
+
+	if conf, err := config.LoadConfig(configPath); err == nil {
+		pm.Lock()
+		pm.config = conf
+		pm.Unlock()
+	}
+	return nil
 }
 
 func loadRecipeCatalog(backendDir string) ([]RecipeCatalogItem, map[string]RecipeCatalogItem, error) {
@@ -960,6 +1647,51 @@ func hasMacro(root map[string]any, name string) bool {
 	macros := getMap(root, "macros")
 	_, ok := macros[name]
 	return ok
+}
+
+func backendMacroExpr(root map[string]any, suffix string) (string, bool) {
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" {
+		return "", false
+	}
+
+	kind := detectRecipeBackendKind(recipesBackendDir())
+	candidates := make([]string, 0, 8)
+	seen := map[string]struct{}{}
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		candidates = append(candidates, name)
+	}
+
+	switch kind {
+	case "trtllm":
+		add("trtllm_" + suffix)
+		add("vllm_" + suffix)
+		add("sqlang_" + suffix)
+	case "sqlang":
+		add("sqlang_" + suffix)
+		add("vllm_" + suffix)
+		add("trtllm_" + suffix)
+	default:
+		add("vllm_" + suffix)
+		add("trtllm_" + suffix)
+		add("sqlang_" + suffix)
+	}
+	add(suffix)
+
+	for _, name := range candidates {
+		if hasMacro(root, name) {
+			return "${" + name + "}", true
+		}
+	}
+	return "", false
 }
 
 func ensureRecipeMacros(root map[string]any, configPath string) {
