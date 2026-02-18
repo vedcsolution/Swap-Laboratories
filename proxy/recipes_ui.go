@@ -751,12 +751,22 @@ func (pm *ProxyManager) upsertRecipeModel(req upsertRecipeModelRequest) (RecipeU
 
 	var cmd string
 	if hotSwap {
-		// Use hot-swap-model.sh for hot swap mode
-		hotSwapArgs := resolvedRecipeRef
-		if resolvedExtraArgs != "" {
-			hotSwapArgs = hotSwapArgs + " " + resolvedExtraArgs
+		// In hot swap mode, remove stopPrefix and use run-recipe.sh directly
+		// This will start the new model without stopping the Ray cluster
+		cmd = fmt.Sprintf("bash -lc 'exec %s %s", runner, quoteForCommand(resolvedRecipeRef))
+		if mode == "solo" {
+			cmd += " --solo"
+		} else {
+			cmd += " -n " + quoteForCommand(nodes)
 		}
-		cmd = fmt.Sprintf("bash -lc '%s %s'", filepath.Join(recipesBackendDir(), "hot-swap-model.sh"), hotSwapArgs)
+		if tp > 0 {
+			cmd += " --tp " + strconv.Itoa(tp)
+		}
+		cmd += " --port ${PORT}"
+		if resolvedExtraArgs != "" {
+			cmd += " " + resolvedExtraArgs
+		}
+		cmd += "'"
 	} else {
 		cmd = strings.Join(cmdParts, "")
 	}
