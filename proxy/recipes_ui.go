@@ -397,6 +397,38 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 			"NEW_IMAGE="+trtllmSourceImage,
 			"OLD_IMAGE="+previousTRTLLMSourceImage,
 		)
+	case "pull_nvidia_image":
+		if backendKind != "nvidia" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "pull_nvidia_image is only supported for NVIDIA backend"})
+			return
+		}
+		nvidiaImage := resolveNVIDIASourceImage(backendDir, req.SourceImage)
+		if nvidiaImage == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "source image is empty"})
+			return
+		}
+		commandText = fmt.Sprintf("docker pull %s", nvidiaImage)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+		defer cancel()
+		cmd = exec.CommandContext(ctx, "docker", "pull", nvidiaImage)
+	case "update_nvidia_image":
+		if backendKind != "nvidia" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "update_nvidia_image is only supported for NVIDIA backend"})
+			return
+		}
+		nvidiaImage := resolveNVIDIASourceImage(backendDir, req.SourceImage)
+		if nvidiaImage == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "source image is empty"})
+			return
+		}
+		if err := persistNVIDIASourceImage(backendDir, nvidiaImage); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to persist nvidia image: %v", err)})
+			return
+		}
+		commandText = fmt.Sprintf("docker pull %s", nvidiaImage)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+		defer cancel()
+		cmd = exec.CommandContext(ctx, "docker", "pull", nvidiaImage)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported action"})
 		return
@@ -921,6 +953,22 @@ func recipeBackendActionsForKind(kind, backendDir, repoURL string) []RecipeBacke
 				Action:      "update_trtllm_image",
 				Label:       "Update TRT-LLM Image",
 				CommandHint: "./build-and-copy.sh -t trtllm-node --source-image <selected> -c + cleanup previous source image on peer nodes",
+			},
+		)
+		return actions
+	}
+
+	if kind == "nvidia" {
+		actions = append(actions,
+			RecipeBackendActionInfo{
+				Action:      "pull_nvidia_image",
+				Label:       "Pull NVIDIA Image",
+				CommandHint: "docker pull <selected>",
+			},
+			RecipeBackendActionInfo{
+				Action:      "update_nvidia_image",
+				Label:       "Update NVIDIA Image",
+				CommandHint: "docker pull <selected> + persist as new default",
 			},
 		)
 		return actions
