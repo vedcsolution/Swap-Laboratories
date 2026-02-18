@@ -12,6 +12,7 @@ dist/
 .recipes_backend_dir
 llama-benchy-intelligence/
 llama-swap.out
+.llama-swap-*source-image*
 
 # Configuration and secrets
 config.yaml
