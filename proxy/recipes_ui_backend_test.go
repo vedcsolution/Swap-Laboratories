@@ -123,3 +123,41 @@ func TestSwitchRecipeBackendConfigPersistsAndRestores(t *testing.T) {
 		t.Fatalf("vllm scoped config mismatch\nwant:\n%s\ngot:\n%s", vllmBody, string(vllmGot))
 	}
 }
+
+func TestRecipeManagedModelInCatalog(t *testing.T) {
+	catalog := map[string]RecipeCatalogItem{
+		"qwen3-coder-next-vllm-next": {ID: "qwen3-coder-next-vllm-next"},
+	}
+
+	if !recipeManagedModelInCatalog(RecipeManagedModel{}, catalog) {
+		t.Fatalf("empty recipeRef should be allowed")
+	}
+	if !recipeManagedModelInCatalog(RecipeManagedModel{RecipeRef: "qwen3-coder-next-vllm-next"}, catalog) {
+		t.Fatalf("known recipeRef should be allowed")
+	}
+	if recipeManagedModelInCatalog(RecipeManagedModel{RecipeRef: "openai-gpt-oss-120b"}, catalog) {
+		t.Fatalf("unknown recipeRef should be filtered out")
+	}
+}
+
+func TestRecipeEntryTargetsActiveBackend(t *testing.T) {
+	active := filepath.Join(t.TempDir(), "spark-vllm-docker-nvidia")
+	other := filepath.Join(t.TempDir(), "spark-vllm-docker")
+
+	if !recipeEntryTargetsActiveBackend(nil, active) {
+		t.Fatalf("nil metadata should be allowed")
+	}
+	if !recipeEntryTargetsActiveBackend(map[string]any{}, active) {
+		t.Fatalf("missing recipe metadata should be allowed")
+	}
+
+	metaActive := map[string]any{recipeMetadataKey: map[string]any{"backend_dir": active}}
+	if !recipeEntryTargetsActiveBackend(metaActive, active) {
+		t.Fatalf("matching backend_dir should be allowed")
+	}
+
+	metaOther := map[string]any{recipeMetadataKey: map[string]any{"backend_dir": other}}
+	if recipeEntryTargetsActiveBackend(metaOther, active) {
+		t.Fatalf("different backend_dir should be filtered out")
+	}
+}

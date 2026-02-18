@@ -58,6 +58,11 @@ func (pm *ProxyManager) apiUnloadAllModels(c *gin.Context) {
 func (pm *ProxyManager) getModelStatus() []Model {
 	// Extract keys and sort them
 	models := []Model{}
+	activeBackendDir := recipesBackendDir()
+	_, catalogByID, catalogErr := loadRecipeCatalog(activeBackendDir)
+	if catalogErr != nil {
+		catalogByID = nil
+	}
 
 	modelIDs := make([]string, 0, len(pm.config.Models))
 	for modelID := range pm.config.Models {
@@ -67,6 +72,18 @@ func (pm *ProxyManager) getModelStatus() []Model {
 
 	// Iterate over sorted keys
 	for _, modelID := range modelIDs {
+		modelCfg := pm.config.Models[modelID]
+
+		if !recipeEntryTargetsActiveBackend(modelCfg.Metadata, activeBackendDir) {
+			continue
+		}
+		if rm, isRecipe := toRecipeManagedModel(modelID, map[string]any{
+			"cmd":      modelCfg.Cmd,
+			"metadata": modelCfg.Metadata,
+		}, nil); isRecipe && !recipeManagedModelInCatalog(rm, catalogByID) {
+			continue
+		}
+
 		// Get process state
 		processGroup := pm.findGroupByModelName(modelID)
 		state := "unknown"
@@ -93,10 +110,10 @@ func (pm *ProxyManager) getModelStatus() []Model {
 		}
 		models = append(models, Model{
 			Id:          modelID,
-			Name:        pm.config.Models[modelID].Name,
-			Description: pm.config.Models[modelID].Description,
+			Name:        modelCfg.Name,
+			Description: modelCfg.Description,
 			State:       state,
-			Unlisted:    pm.config.Models[modelID].Unlisted,
+			Unlisted:    modelCfg.Unlisted,
 		})
 	}
 

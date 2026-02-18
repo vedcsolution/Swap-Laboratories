@@ -25,23 +25,23 @@ import (
 )
 
 const (
-	recipesBackendDirEnv           = "LLAMA_SWAP_RECIPES_BACKEND_DIR"
-	recipesBackendOverrideFileEnv  = "LLAMA_SWAP_RECIPES_BACKEND_OVERRIDE_FILE"
-	recipesLocalDirEnv             = "LLAMA_SWAP_LOCAL_RECIPES_DIR"
-	trtllmSourceImageOverrideFile  = ".llama-swap-trtllm-source-image"
-	defaultRecipesBackendSubdir    = "spark-vllm-docker"
-	defaultRecipesBackendAltSubdir = "spark-trtllm-docker"
-	defaultRecipesBackendSQLSubdir = "spark-sqlang-docker"
+	recipesBackendDirEnv              = "LLAMA_SWAP_RECIPES_BACKEND_DIR"
+	recipesBackendOverrideFileEnv     = "LLAMA_SWAP_RECIPES_BACKEND_OVERRIDE_FILE"
+	recipesLocalDirEnv                = "LLAMA_SWAP_LOCAL_RECIPES_DIR"
+	trtllmSourceImageOverrideFile     = ".llama-swap-trtllm-source-image"
+	defaultRecipesBackendSubdir       = "spark-vllm-docker"
+	defaultRecipesBackendAltSubdir    = "spark-trtllm-docker"
+	defaultRecipesBackendSQLSubdir    = "spark-sqlang-docker"
 	defaultRecipesBackendNvidiaSubdir = "spark-vllm-docker-nvidia"
-	defaultRecipesLocalSubdir      = "llama-swap/recipes"
-	defaultRecipeGroupName         = "managed-recipes"
-	defaultTRTLLMImageTag          = "trtllm-node"
-	defaultTRTLLMSourceImage       = "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3"
-	trtllmDeploymentGuideURL       = "https://build.nvidia.com/spark/trt-llm/stacked-sparks"
-	recipeMetadataKey              = "recipe_ui"
-	recipeMetadataManagedField     = "managed"
-	nvcrProxyAuthURL              = "https://nvcr.io/proxy_auth?scope=repository:nvidia/tensorrt-llm/release:pull"
-	nvcrTagsListURL               = "https://nvcr.io/v2/nvidia/tensorrt-llm/release/tags/list?n=2000"
+	defaultRecipesLocalSubdir         = "llama-swap/recipes"
+	defaultRecipeGroupName            = "managed-recipes"
+	defaultTRTLLMImageTag             = "trtllm-node"
+	defaultTRTLLMSourceImage          = "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3"
+	trtllmDeploymentGuideURL          = "https://build.nvidia.com/spark/trt-llm/stacked-sparks"
+	recipeMetadataKey                 = "recipe_ui"
+	recipeMetadataManagedField        = "managed"
+	nvcrProxyAuthURL                  = "https://nvcr.io/proxy_auth?scope=repository:nvidia/tensorrt-llm/release:pull"
+	nvcrTagsListURL                   = "https://nvcr.io/v2/nvidia/tensorrt-llm/release/tags/list?n=2000"
 )
 
 var (
@@ -454,7 +454,8 @@ func (pm *ProxyManager) buildRecipeUIState() (RecipeUIState, error) {
 		return RecipeUIState{}, err
 	}
 
-	catalog, _, err := loadRecipeCatalog(recipesBackendDir())
+	backendDir := recipesBackendDir()
+	catalog, catalogByID, err := loadRecipeCatalog(backendDir)
 	if err != nil {
 		return RecipeUIState{}, err
 	}
@@ -473,8 +474,11 @@ func (pm *ProxyManager) buildRecipeUIState() (RecipeUIState, error) {
 		if !ok {
 			continue
 		}
+		if !recipeEntryTargetsActiveBackend(getMap(modelMap, "metadata"), backendDir) {
+			continue
+		}
 		rm, ok := toRecipeManagedModel(modelID, modelMap, groupsMap)
-		if ok {
+		if ok && recipeManagedModelInCatalog(rm, catalogByID) {
 			models = append(models, rm)
 		}
 	}
@@ -483,7 +487,7 @@ func (pm *ProxyManager) buildRecipeUIState() (RecipeUIState, error) {
 	groupNames := sortedGroupNames(groupsMap)
 	return RecipeUIState{
 		ConfigPath: configPath,
-		BackendDir: recipesBackendDir(),
+		BackendDir: backendDir,
 		Recipes:    catalog,
 		Models:     models,
 		Groups:     groupNames,
@@ -1737,7 +1741,7 @@ func ensureRecipeMacros(root map[string]any, configPath string) {
 		macros["llama_root"] = "${user_home}/llama-swap"
 	}
 
-		kind := detectRecipeBackendKind(backendDir)
+	kind := detectRecipeBackendKind(backendDir)
 	if kind == "vllm_nvidia" {
 		if _, ok := macros["vllm_nvidia_nodes"]; !ok {
 			if v := strings.TrimSpace(fmt.Sprintf("%v", macros["vllm_nodes"])); v != "" && v != "<nil>" {
@@ -1824,6 +1828,43 @@ func uniqueStrings(items []string) []any {
 	}
 	sort.Strings(out)
 	return toAnySlice(out)
+}
+
+func canonicalRecipeBackendDir(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	path = expandLeadingTilde(path)
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func recipeEntryTargetsActiveBackend(metadata map[string]any, activeBackendDir string) bool {
+	active := canonicalRecipeBackendDir(activeBackendDir)
+	if active == "" {
+		return true
+	}
+	recipeMeta := getMap(metadata, recipeMetadataKey)
+	backendDir := canonicalRecipeBackendDir(getString(recipeMeta, "backend_dir"))
+	if backendDir == "" {
+		return true
+	}
+	return backendDir == active
+}
+
+func recipeManagedModelInCatalog(model RecipeManagedModel, catalogByID map[string]RecipeCatalogItem) bool {
+	if len(catalogByID) == 0 {
+		return true
+	}
+	ref := strings.TrimSpace(model.RecipeRef)
+	if ref == "" {
+		return true
+	}
+	_, ok := catalogByID[ref]
+	return ok
 }
 
 func cleanAliases(aliases []string) []string {
