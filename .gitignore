@@ -21,3 +21,7 @@ config.*.yaml
 secrets/
 *.pem
 *.key
+
+# Node modules
+ui/node_modules/
+ui-svelte/node_modules/

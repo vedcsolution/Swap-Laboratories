@@ -7,6 +7,7 @@
   let loading = $state(true);
   let refreshing = $state(false);
   let dgxUpdating = $state(false);
+  let dgxUpdatingTargets = $state<Record<string, boolean>>({});
   let error = $state<string | null>(null);
   let dgxActionError = $state<string | null>(null);
   let dgxActionResult = $state<string | null>(null);
@@ -34,7 +35,28 @@
 
   function hasUpdatableDGXNodes(): boolean {
     if (!state) return false;
-    return state.nodes.some((node) => (node.isLocal || node.sshOk) && node.dgx?.supported);
+    return state.nodes.some((node) => isNodeDGXUpdatable(node));
+  }
+
+  function isNodeDGXUpdatable(node: ClusterStatusState["nodes"][number]): boolean {
+    return (node.isLocal || node.sshOk) && Boolean(node.dgx?.supported);
+  }
+
+  function isNodeUpdating(ip: string): boolean {
+    return Boolean(dgxUpdatingTargets[ip]);
+  }
+
+  function markTargetsUpdating(targets: string[], updating: boolean): void {
+    const next = { ...dgxUpdatingTargets };
+    for (const target of targets) {
+      if (!target) continue;
+      if (updating) {
+        next[target] = true;
+      } else {
+        delete next[target];
+      }
+    }
+    dgxUpdatingTargets = next;
   }
 
   function storagePresence(ip: string, path: string) {
@@ -83,24 +105,16 @@
     }
   }
 
-  async function runDgxUpdate(): Promise<void> {
+  async function executeDgxUpdate(targets: string[]): Promise<void> {
     if (!state || dgxUpdating) return;
-
-    const targets = state.nodes
-      .filter((node) => (node.isLocal || node.sshOk) && node.dgx?.supported)
-      .map((node) => node.ip);
     if (targets.length === 0) {
       dgxActionError = "No hay nodos alcanzables por SSH para ejecutar UpdateAndReboot.";
       dgxActionResult = null;
       return;
     }
 
-    const confirmed = window.confirm(
-      `Se ejecutará UpdateAndReboot en ${targets.length} nodo(s):\n${targets.join("\n")}\n\nEl proceso puede terminar en reboot automático.`
-    );
-    if (!confirmed) return;
-
     dgxUpdating = true;
+    markTargetsUpdating(targets, true);
     dgxActionError = null;
     dgxActionResult = null;
     try {
@@ -112,8 +126,44 @@
       dgxActionError = e instanceof Error ? e.message : String(e);
       dgxActionResult = null;
     } finally {
+      markTargetsUpdating(targets, false);
       dgxUpdating = false;
     }
+  }
+
+  async function runDgxUpdate(): Promise<void> {
+    if (!state || dgxUpdating) return;
+
+    const targets = state.nodes.filter((node) => isNodeDGXUpdatable(node)).map((node) => node.ip);
+    if (targets.length === 0) {
+      dgxActionError = "No hay nodos alcanzables por SSH para ejecutar UpdateAndReboot.";
+      dgxActionResult = null;
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Se ejecutará UpdateAndReboot en ${targets.length} nodo(s):\n${targets.join("\n")}\n\nEl proceso puede terminar en reboot automático.`
+    );
+    if (!confirmed) return;
+
+    await executeDgxUpdate(targets);
+  }
+
+  async function runDgxUpdateNode(nodeIP: string): Promise<void> {
+    if (!state || dgxUpdating) return;
+    const node = state.nodes.find((n) => n.ip === nodeIP);
+    if (!node || !isNodeDGXUpdatable(node)) {
+      dgxActionError = `El nodo ${nodeIP} no está disponible para UpdateAndReboot.`;
+      dgxActionResult = null;
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Se ejecutará UpdateAndReboot solo en el nodo:\n${nodeIP}\n\nEl proceso puede terminar en reboot automático.`
+    );
+    if (!confirmed) return;
+
+    await executeDgxUpdate([nodeIP]);
   }
 
   onMount(() => {
@@ -265,6 +315,7 @@
               <th class="text-left p-2 border-b border-card-border">Port 22</th>
               <th class="text-left p-2 border-b border-card-border">SSH BatchMode</th>
               <th class="text-left p-2 border-b border-card-border">DGX Update</th>
+              <th class="text-left p-2 border-b border-card-border">Acción</th>
               <th class="text-left p-2 border-b border-card-border">DGX Estado</th>
               <th class="text-left p-2 border-b border-card-border">Error</th>
             </tr>
@@ -298,6 +349,20 @@
                     {:else}
                       <span class="text-txtsecondary">n/a</span>
                     {/if}
+                  {:else}
+                    <span class="text-txtsecondary">-</span>
+                  {/if}
+                </td>
+                <td class="p-2 border-b border-card-border">
+                  {#if isNodeDGXUpdatable(node)}
+                    <button
+                      class="btn btn--sm"
+                      onclick={() => runDgxUpdateNode(node.ip)}
+                      disabled={dgxUpdating}
+                      title={`UpdateAndReboot en ${node.ip}`}
+                    >
+                      {isNodeUpdating(node.ip) ? "Updating..." : "Update"}
+                    </button>
                   {:else}
                     <span class="text-txtsecondary">-</span>
                   {/if}

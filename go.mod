@@ -1,13 +1,16 @@
-module github.com/mostlygeek/llama-swap
+module github.com/vedcsolution/llama-swap
 
 go 1.24.0
 
 toolchain go1.24.13
 
+replace github.com/mostlygeek/llama-swap => .
+
 require (
 	github.com/billziss-gh/golib v0.2.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.10.0
+	github.com/mostlygeek/llama-swap v0.0.0
 	github.com/stretchr/testify v1.9.0
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5

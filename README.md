@@ -31,7 +31,7 @@ This repository keeps the core model-swap proxy behavior and adds an operations 
 
 ## Requirements
 
-- Go `1.25+`
+- Go `1.24+`
 - Node.js + npm (for Svelte UI build)
 - Linux environment recommended for cluster/backend operations
 - Docker and SSH access for recipe backends (depends on your backend repo)
