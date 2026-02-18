@@ -44,7 +44,12 @@ func main() {
 
 	conf, err := config.LoadConfig(*configPath)
 	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
+		if os.IsNotExist(err) {
+			fmt.Printf("Config file not found: %s\n", *configPath)
+			fmt.Println("Run \"cp config.example.yaml config.yaml\" to create one")
+		} else {
+			fmt.Printf("Error loading config: %v\n", err)
+		}
 		os.Exit(1)
 	}
 
