@@ -73,6 +73,7 @@ type recipeCatalogMeta struct {
 	SoloOnly    bool           `yaml:"solo_only"`
 	ClusterOnly bool           `yaml:"cluster_only"`
 	Defaults    map[string]any `yaml:"defaults"`
+	Container   string         `yaml:"container"`
 }
 
 type RecipeCatalogItem struct {
@@ -86,6 +87,7 @@ type RecipeCatalogItem struct {
 	ClusterOnly           bool   `json:"clusterOnly"`
 	DefaultTensorParallel int    `json:"defaultTensorParallel"`
 	DefaultExtraArgs      string `json:"defaultExtraArgs,omitempty"`
+	ContainerImage        string `json:"containerImage,omitempty"`
 }
 
 type RecipeManagedModel struct {
@@ -2210,6 +2212,7 @@ func loadRecipeCatalog(backendDir string) ([]RecipeCatalogItem, map[string]Recip
 			ClusterOnly:           meta.ClusterOnly,
 			DefaultTensorParallel: defaultTP,
 			DefaultExtraArgs:      defaultExtraArgs,
+			ContainerImage:        strings.TrimSpace(meta.Container),
 		}
 		items = append(items, item)
 		byID[id] = item

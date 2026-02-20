@@ -16,12 +16,13 @@ import (
 )
 
 type Model struct {
-	Id          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	State       string `json:"state"`
-	Unlisted    bool   `json:"unlisted"`
-	PeerID      string `json:"peerID"`
+	Id             string `json:"id"`
+	Name           string `json:"name"`
+	Description    string `json:"description"`
+	State          string `json:"state"`
+	Unlisted       bool   `json:"unlisted"`
+	PeerID         string `json:"peerID"`
+	ContainerImage string `json:"containerImage,omitempty"`
 }
 
 func addApiHandlers(pm *ProxyManager) {
@@ -135,6 +136,96 @@ func detectVLLMFallbackContainers() ([]string, error) {
 	return containers, nil
 }
 
+func normalizeContainerImage(value any) string {
+	container := strings.TrimSpace(fmt.Sprintf("%v", value))
+	if container == "" || container == "<nil>" {
+		return ""
+	}
+	return container
+}
+
+func catalogContainerImage(catalogByID map[string]RecipeCatalogItem, recipeRef string) string {
+	recipeRef = strings.TrimSpace(recipeRef)
+	if recipeRef == "" || len(catalogByID) == 0 {
+		return ""
+	}
+
+	candidates := []string{recipeRef}
+	if slash := strings.LastIndex(recipeRef, "/"); slash >= 0 {
+		candidates = append(candidates, recipeRef[slash+1:])
+	}
+
+	seen := make(map[string]struct{}, len(candidates)*2)
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		for _, key := range []string{candidate, strings.TrimSuffix(strings.TrimSuffix(candidate, ".yaml"), ".yml")} {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if item, ok := catalogByID[key]; ok {
+				if container := normalizeContainerImage(item.ContainerImage); container != "" {
+					return container
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func resolveModelContainerImage(modelID, cmd string, metadata map[string]any, catalogByID map[string]RecipeCatalogItem, defaultContainerImage string) string {
+	if len(metadata) > 0 {
+		if recipeRaw, ok := metadata["recipe_ui"]; ok {
+			if recipeMeta, ok := recipeRaw.(map[string]any); ok {
+				if container := normalizeContainerImage(recipeMeta["container_image"]); container != "" {
+					return container
+				}
+			}
+		}
+
+		for _, key := range []string{"container_image", "containerImage"} {
+			if container := normalizeContainerImage(metadata[key]); container != "" {
+				return container
+			}
+		}
+	}
+
+	recipeRef := ""
+	if len(metadata) > 0 {
+		if recipeRaw, ok := metadata["recipe_ui"]; ok {
+			if recipeMeta, ok := recipeRaw.(map[string]any); ok {
+				recipeRef = strings.TrimSpace(fmt.Sprintf("%v", recipeMeta["recipe_ref"]))
+			}
+		}
+	}
+	if recipeRef == "" {
+		if matches := recipeRunnerRe.FindStringSubmatch(strings.TrimSpace(cmd)); len(matches) > 1 {
+			recipeRef = strings.TrimSpace(matches[1])
+		}
+	}
+
+	if container := catalogContainerImage(catalogByID, recipeRef); container != "" {
+		return container
+	}
+	if container := catalogContainerImage(catalogByID, modelID); container != "" {
+		return container
+	}
+
+	if container := normalizeContainerImage(defaultContainerImage); container != "" {
+		return container
+	}
+
+	return ""
+}
+
 func (pm *ProxyManager) getModelStatus() []Model {
 	// Extract keys and sort them
 	models := []Model{}
@@ -142,6 +233,10 @@ func (pm *ProxyManager) getModelStatus() []Model {
 	_, catalogByID, catalogErr := loadRecipeCatalog(activeBackendDir)
 	if catalogErr != nil {
 		catalogByID = nil
+	}
+	defaultContainerImage := ""
+	if container, ok := pm.config.Macros.Get("vllm_container_image"); ok {
+		defaultContainerImage = normalizeContainerImage(container)
 	}
 
 	type probeCandidate struct {
@@ -183,11 +278,12 @@ func (pm *ProxyManager) getModelStatus() []Model {
 
 		idx := len(models)
 		models = append(models, Model{
-			Id:          modelID,
-			Name:        modelCfg.Name,
-			Description: modelCfg.Description,
-			State:       state,
-			Unlisted:    modelCfg.Unlisted,
+			Id:             modelID,
+			Name:           modelCfg.Name,
+			Description:    modelCfg.Description,
+			State:          state,
+			Unlisted:       modelCfg.Unlisted,
+			ContainerImage: resolveModelContainerImage(modelID, modelCfg.Cmd, modelCfg.Metadata, catalogByID, defaultContainerImage),
 		})
 
 		if state == string(StateStopped) || state == "unknown" {

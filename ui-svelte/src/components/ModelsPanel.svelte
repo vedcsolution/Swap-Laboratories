@@ -434,6 +434,7 @@
       <thead class="sticky top-0 bg-card z-10">
         <tr class="text-left border-b border-gray-200 dark:border-white/10 bg-surface">
           <th>{$showIdorNameStore === "id" ? "Model ID" : "Name"}</th>
+          <th>Container Image</th>
           <th></th>
           <th>State</th>
         </tr>
@@ -448,6 +449,9 @@
               {#if model.description}
                 <p class={model.unlisted ? "text-opacity-70" : ""}><em>{model.description}</em></p>
               {/if}
+            </td>
+            <td class="font-mono text-xs break-all text-txtsecondary w-[28rem] max-w-[28rem]">
+              {model.containerImage || "-"}
             </td>
             <td class="w-auto">
               <div class="flex justify-end gap-2 items-center flex-wrap">
