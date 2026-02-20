@@ -32,7 +32,8 @@ func (pm *ProxyManager) apiStopCluster(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+	baseCtx := context.WithoutCancel(c.Request.Context())
+	ctx, cancel := context.WithTimeout(baseCtx, 2*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", scriptPath, "stop")

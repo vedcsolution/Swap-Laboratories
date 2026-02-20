@@ -1,7 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getRecipeBackendState, runRecipeBackendAction, setRecipeBackend } from "../stores/api";
-  import type { RecipeBackendAction, RecipeBackendState } from "../lib/types";
+  import {
+    deleteRecipeBackendHFModel,
+    getRecipeBackendHFModels,
+    getRecipeBackendState,
+    runRecipeBackendAction,
+    setRecipeBackend,
+  } from "../stores/api";
+  import type { RecipeBackendAction, RecipeBackendHFModel, RecipeBackendState } from "../lib/types";
   import { collapseHomePath } from "../lib/pathDisplay";
 
   let loading = $state(true);
@@ -18,6 +24,12 @@
   let actionOutput = $state("");
   let selectedTrtllmImage = $state("");
   let selectedNvidiaImage = $state("");
+  let selectedLlamacppImage = $state("");
+  let hfModelName = $state("QuantTrio/MiniMax-M2-AWQ");
+  let hfModelsLoading = $state(false);
+  let deletingHFModel = $state("");
+  let hfHubPath = $state("");
+  let hfModels = $state<RecipeBackendHFModel[]>([]);
   let refreshController: AbortController | null = null;
 
   function sourceLabel(source: RecipeBackendState["backendSource"]): string {
@@ -30,10 +42,6 @@
     const v = (vendor || "").trim();
     if (!v) return kind;
     return `${kind} (${v})`;
-  }
-
-  function isNvidiaBackendOption(path: string): boolean {
-    return path.toLowerCase().includes("spark-trtllm-docker") || path.toLowerCase().includes("spark-vllm-docker-nvidia");
   }
 
   function syncSelectionFromState(next: RecipeBackendState): void {
@@ -57,6 +65,12 @@
       selectedNvidiaImage = next.nvidiaImage.selected;
     } else {
       selectedNvidiaImage = "";
+    }
+
+    if (next.llamacppImage?.selected) {
+      selectedLlamacppImage = next.llamacppImage.selected;
+    } else {
+      selectedLlamacppImage = "";
     }
   }
 
@@ -96,6 +110,33 @@
     return out;
   }
 
+  function llamacppImageOptions(next: RecipeBackendState | null): string[] {
+    if (!next?.llamacppImage) return [];
+    const out: string[] = [];
+    const push = (v?: string) => {
+      const value = (v || "").trim();
+      if (!value || out.includes(value)) return;
+      out.push(value);
+    };
+
+    push(next.llamacppImage.selected);
+    push(next.llamacppImage.default);
+    for (const img of next.llamacppImage.available || []) {
+      push(img);
+    }
+    return out;
+  }
+
+  function hfDownloadAction(next: RecipeBackendState | null): RecipeBackendState["actions"][number] | null {
+    if (!next) return null;
+    return next.actions.find((info) => info.action === "download_hf_model") || null;
+  }
+
+  function backendActionsWithoutHF(next: RecipeBackendState | null): RecipeBackendState["actions"] {
+    if (!next) return [];
+    return next.actions.filter((info) => info.action !== "download_hf_model");
+  }
+
   function runningLabel(action: string): string {
     switch (action) {
       case "git_pull":
@@ -106,6 +147,8 @@
         return "Building vLLM...";
       case "build_mxfp4":
         return "Building MXFP4...";
+      case "build_vllm_12_0f":
+        return "Building 12.0f...";
       case "pull_trtllm_image":
         return "Pulling TRT-LLM image...";
       case "update_trtllm_image":
@@ -114,8 +157,64 @@
         return "Pulling NVIDIA image...";
       case "update_nvidia_image":
         return "Updating NVIDIA image...";
+      case "pull_llamacpp_image":
+        return "Pulling llama.cpp image...";
+      case "update_llamacpp_image":
+        return "Updating llama.cpp image...";
+      case "download_hf_model":
+        return "Downloading HF model...";
       default:
         return "Running...";
+    }
+  }
+
+  function formatBytes(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    const digits = unitIndex === 0 ? 0 : value >= 100 ? 0 : value >= 10 ? 1 : 2;
+    return `${value.toFixed(digits)} ${units[unitIndex]}`;
+  }
+
+  async function refreshHFModels(signal?: AbortSignal): Promise<void> {
+    hfModelsLoading = true;
+    try {
+      const next = await getRecipeBackendHFModels(signal);
+      hfHubPath = next.hubPath || "";
+      hfModels = next.models || [];
+    } catch {
+      // Keep backend page functional even if HF cache is unavailable.
+      hfHubPath = "";
+      hfModels = [];
+    } finally {
+      hfModelsLoading = false;
+    }
+  }
+
+  async function deleteHFModel(model: RecipeBackendHFModel): Promise<void> {
+    if (deletingHFModel) return;
+    const target = model.modelId || model.cacheDir;
+    if (!confirm(`Eliminar modelo descargado ${target}?`)) return;
+
+    deletingHFModel = model.cacheDir;
+    error = null;
+    notice = null;
+    actionCommand = "";
+    actionOutput = "";
+    try {
+      const next = await deleteRecipeBackendHFModel(model.cacheDir);
+      hfHubPath = next.hubPath || "";
+      hfModels = next.models || [];
+      notice = `Modelo eliminado: ${target}`;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      deletingHFModel = "";
     }
   }
 
@@ -133,6 +232,7 @@
       const next = await getRecipeBackendState(controller.signal);
       state = next;
       syncSelectionFromState(next);
+      await refreshHFModels(controller.signal);
     } catch (e) {
       if (controller.signal.aborted) {
         error = "Timeout consultando backend. Pulsa Refresh para reintentar.";
@@ -166,6 +266,7 @@
       const next = await setRecipeBackend(backendDir);
       state = next;
       syncSelectionFromState(next);
+      await refreshHFModels();
       notice = "Backend actualizado correctamente.";
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -188,12 +289,19 @@
     actionOutput = "";
 
     try {
-      const opts =
-        (action === "pull_trtllm_image" || action === "update_trtllm_image") && selectedTrtllmImage.trim()
-          ? { sourceImage: selectedTrtllmImage.trim() }
-          : (action === "pull_nvidia_image" || action === "update_nvidia_image") && selectedNvidiaImage.trim()
-          ? { sourceImage: selectedNvidiaImage.trim() }
-          : undefined;
+      const sourceImage =
+        (action === "pull_trtllm_image" || action === "update_trtllm_image")
+          ? selectedTrtllmImage.trim()
+          : (action === "pull_nvidia_image" || action === "update_nvidia_image")
+            ? selectedNvidiaImage.trim()
+            : (action === "pull_llamacpp_image" || action === "update_llamacpp_image")
+              ? selectedLlamacppImage.trim()
+              : "";
+      const hfModel = action === "download_hf_model" ? hfModelName.trim() : "";
+      if (action === "download_hf_model" && !hfModel) {
+        throw new Error("Introduce el nombre del modelo de Hugging Face (org/model).");
+      }
+      const opts = sourceImage || hfModel ? { sourceImage, hfModel } : undefined;
       const result = await runRecipeBackendAction(action as RecipeBackendAction, opts);
       actionCommand = result.command || "";
       actionOutput = result.output || "";
@@ -204,7 +312,10 @@
         action === "pull_trtllm_image" ||
         action === "update_trtllm_image" ||
         action === "pull_nvidia_image" ||
-        action === "update_nvidia_image"
+        action === "update_nvidia_image" ||
+        action === "pull_llamacpp_image" ||
+        action === "update_llamacpp_image" ||
+        action === "download_hf_model"
       ) {
         await refresh();
       }
@@ -227,8 +338,7 @@
   <div class="card shrink-0">
     <div class="flex items-center justify-between gap-2">
       <h2 class="pb-0">Backend</h2>
-      <button class="btn btn--sm" onclick={refresh} disabled={refreshing || saving}>
-        {refreshing ? "Refreshing..." : "Refresh"}
+      <button class="btn btn--sm" onclick={refresh} disabled={refreshing || saving}>{refreshing ? "Refreshing..." : "Refresh"}
       </button>
     </div>
 
@@ -276,9 +386,6 @@
               }}
             />
             <span class="font-mono break-all" title={option}>{collapseHomePath(option)}</span>
-            {#if isNvidiaBackendOption(option)}
-              <span class="text-[11px] px-1.5 py-0.5 rounded border border-cyan-400/40 text-cyan-300">nvidia</span>
-            {/if}
           </label>
         {/each}
 
@@ -348,6 +455,7 @@
         </div>
       {/if}
 
+
       {#if state.backendKind === "nvidia" && state.nvidiaImage}
         <div class="mt-4 p-3 border border-card-border rounded bg-background/40 space-y-2">
           <div class="text-sm text-txtsecondary">NVIDIA vLLM image (vllm-openai)</div>
@@ -387,14 +495,101 @@
         </div>
       {/if}
 
+
+      {#if state.backendKind === "llamacpp" && state.llamacppImage}
+        <div class="mt-4 p-3 border border-card-border rounded bg-background/40 space-y-2">
+          <div class="text-sm text-txtsecondary">llama.cpp source image</div>
+          {#if state.deploymentGuideUrl}
+            <div class="text-xs text-txtsecondary break-all">
+              Guía técnica:
+              <a class="underline text-cyan-300" href={state.deploymentGuideUrl} target="_blank" rel="noreferrer">{state.deploymentGuideUrl}</a>
+            </div>
+          {/if}
+          <select class="w-full px-2 py-1 rounded border border-card-border bg-background font-mono text-sm" bind:value={selectedLlamacppImage}>
+            {#each llamacppImageOptions(state) as image}
+              <option value={image}>{image}</option>
+            {/each}
+          </select>
+          <input
+            class="input w-full font-mono text-sm"
+            bind:value={selectedLlamacppImage}
+            placeholder="llama-cpp-spark:last"
+          />
+          <div class="text-xs text-txtsecondary break-all">default: <span class="font-mono">{state.llamacppImage.default}</span></div>
+          {#if state.llamacppImage.warning}
+            <div class="p-2 border border-amber-500/30 bg-amber-500/10 rounded text-xs text-amber-300 break-words">
+              {state.llamacppImage.warning}
+            </div>
+          {/if}
+          <div class="text-xs text-txtsecondary">Se guarda como preferencia de imagen para despliegues llama.cpp.</div>
+        </div>
+      {/if}
+
+
       <div class="mt-4 pt-3 border-t border-card-border">
         <div class="text-sm text-txtsecondary mb-2">Backend actions</div>
 
-        {#if state.actions.length === 0}
-          <div class="text-xs text-txtsecondary">No hay acciones disponibles para este backend.</div>
+        {#if hfDownloadAction(state)}
+          <div class="mb-3 p-3 border border-card-border rounded bg-background/40 space-y-2">
+            <div class="text-sm text-txtsecondary">Descargar modelo desde Hugging Face</div>
+            <input class="input w-full font-mono text-sm" bind:value={hfModelName} placeholder="QuantTrio/MiniMax-M2-AWQ" />
+            <button
+              class="btn btn--sm"
+              onclick={() => runAction("download_hf_model", hfDownloadAction(state)?.label || "Download HF Model")}
+              disabled={!!actionRunning || saving || refreshing}
+              title={hfDownloadAction(state)?.commandHint || "Download HF Model"}
+            >
+              {actionRunning === "download_hf_model"
+                ? runningLabel("download_hf_model")
+                : (hfDownloadAction(state)?.label || "Download HF Model")}
+            </button>
+            <div class="text-xs text-txtsecondary break-all">
+              Command:
+              <span class="font-mono">{hfDownloadAction(state)?.commandHint || "~/spark-vllm-docker/hf-download.sh <model> -c --copy-parallel"}</span>
+            </div>
+          </div>
+        {/if}
+
+        <div class="mb-3 p-3 border border-card-border rounded bg-background/40 space-y-2">
+          <div class="text-sm text-txtsecondary">Modelos descargados (Hugging Face)</div>
+          <div class="text-xs text-txtsecondary break-all">
+            Cache:
+            <span class="font-mono">{hfHubPath || "~/.cache/huggingface/hub"}</span>
+          </div>
+          {#if hfModelsLoading}
+            <div class="text-xs text-txtsecondary">Leyendo modelos descargados...</div>
+          {:else if hfModels.length === 0}
+            <div class="text-xs text-txtsecondary">No hay modelos descargados.</div>
+          {:else}
+            <div class="space-y-2">
+              {#each hfModels as model (model.cacheDir)}
+                <div class="p-2 border border-card-border rounded bg-background/60">
+                  <div class="text-sm font-mono text-txtmain break-all">{model.modelId || model.cacheDir}</div>
+                  <div class="text-xs text-txtsecondary break-all">{collapseHomePath(model.path)}</div>
+                  <div class="text-xs text-txtsecondary">Tamaño: {formatBytes(model.sizeBytes)} | Actualizado: {model.modifiedAt}</div>
+                  <div class="mt-2">
+                    <button
+                      class="btn btn--sm"
+                      onclick={() => deleteHFModel(model)}
+                      disabled={!!actionRunning || saving || refreshing || !!deletingHFModel}
+                      title={`Eliminar ${model.modelId || model.cacheDir}`}
+                    >
+                      {deletingHFModel === model.cacheDir ? "Eliminando..." : "Eliminar"}
+                    </button>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        {#if backendActionsWithoutHF(state).length === 0}
+          {#if !hfDownloadAction(state)}
+            <div class="text-xs text-txtsecondary">No hay acciones disponibles para este backend.</div>
+          {/if}
         {:else}
           <div class="flex flex-wrap gap-2">
-            {#each state.actions as info (info.action + info.label)}
+            {#each backendActionsWithoutHF(state) as info (info.action + info.label)}
               <button
                 class="btn btn--sm"
                 onclick={() => runAction(info.action, info.label)}

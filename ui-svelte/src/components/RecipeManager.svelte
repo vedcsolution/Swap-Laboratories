@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { deleteRecipeModel, getRecipeUIState, upsertRecipeModel } from "../stores/api";
+  import { deleteRecipeModel, getRecipeUIState, upsertRecipeModel, getDockerContainers } from "../stores/api";
   import type { RecipeManagedModel, RecipeUIState } from "../lib/types";
   import { collapseHomePath } from "../lib/pathDisplay";
 
@@ -26,6 +26,8 @@
   let unlisted = $state(false);
   let benchyTrustRemoteCode = $state<"auto" | "true" | "false">("auto");
   let hotSwap = $state(false);
+  let containerImage = $state("");
+  let availableContainers = $state<string[]>([]);
   let refreshController: AbortController | null = null;
 
   function clearForm(): void {
@@ -40,6 +42,7 @@
     tensorParallel = 2;
     nodes = "";
     hotSwap = false;
+    containerImage = "";
     extraArgs = "";
     group = "managed-recipes";
     unlisted = false;
@@ -67,6 +70,8 @@
     } else {
       benchyTrustRemoteCode = "auto";
     }
+
+    containerImage = model.containerImage || model.metadata?.container_image || "";
   }
 
   async function refreshState(): Promise<void> {
@@ -75,6 +80,7 @@
     refreshController = controller;
     const timeout = setTimeout(() => controller.abort(), 10000);
 
+    void loadDockerContainers();
     loading = true;
     error = null;
     try {
@@ -94,6 +100,15 @@
         refreshController = null;
       }
       loading = false;
+    }
+  }
+
+  async function loadDockerContainers(): Promise<void> {
+    try {
+      availableContainers = await getDockerContainers();
+    } catch (e) {
+      console.error("Failed to load containers:", e);
+      availableContainers = [];
     }
   }
 
@@ -131,6 +146,7 @@
         tensorParallel,
         nodes: nodes.trim(),
         extraArgs: extraArgs.trim(),
+        containerImage: containerImage.trim(),
         group: group.trim(),
         unlisted,
         hotSwap,
@@ -174,6 +190,7 @@
 
   onMount(() => {
     void refreshState();
+    void loadDockerContainers();
     return () => {
       refreshController?.abort();
     };
@@ -261,6 +278,20 @@
       <label class="text-sm md:col-span-2">
         <div class="text-txtsecondary mb-1">Extra Args</div>
         <input class="w-full px-2 py-1 rounded border border-card-border bg-background font-mono" bind:value={extraArgs} placeholder="--gpu-mem 0.9 --max-model-len 185000 -- --enable-prefix-caching" />
+      </label>
+      <label class="text-sm md:col-span-2">
+        <div class="text-txtsecondary mb-1">Container Image</div>
+        <input
+          class="w-full px-2 py-1 rounded border border-card-border bg-background font-mono"
+          bind:value={containerImage}
+          list="container-images-list"
+          placeholder="vllm-node:latest"
+        />
+        <datalist id="container-images-list">
+          {#each availableContainers as container}
+            <option value={container}></option>
+          {/each}
+        </datalist>
       </label>
       <label class="text-sm">
         <div class="text-txtsecondary mb-1">Benchy trust_remote_code</div>

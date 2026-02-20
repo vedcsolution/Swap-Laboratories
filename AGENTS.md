@@ -48,3 +48,12 @@ fixes #123
 - Include a suggestion with each discovered item
 - Limit your code review to three items with the highest priority first
 - Double check your discovered items and recommended remediations
+
+## Build Image Policy
+
+- Use only one Go build container image on this host: `golang:1.24-bookworm`.
+- Do not use `golang:latest` or multiple Go tags in parallel.
+- Preferred build command:
+  - `docker run --rm -v /home/csolutions_ai/swap-laboratories:/src -w /src golang:1.24-bookworm go build -buildvcs=false -o build/llama-swap .`
+- Systemd service must run fork binary from repo path, not global binary:
+  - `ExecStart=/home/csolutions_ai/swap-laboratories/build/llama-swap ...`

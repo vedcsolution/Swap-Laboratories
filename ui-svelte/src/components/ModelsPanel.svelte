@@ -3,14 +3,18 @@
     models,
     loadModel,
     unloadAllModels,
-    stopClusterAndUnload,
+    stopCluster,
     unloadSingleModel,
     startBenchy,
     getBenchyJob,
     cancelBenchyJob,
+    getDockerContainers,
+    getRecipeUIState,
+    upsertRecipeModel,
   } from "../stores/api";
   import { isNarrow } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
+  import { onMount, onDestroy } from "svelte";
   import BenchyDialog from "./BenchyDialog.svelte";
   import RecipeManager from "./RecipeManager.svelte";
   import type { BenchyJob, BenchyStartOptions, Model } from "../lib/types";
@@ -19,6 +23,15 @@
   let isStoppingCluster = $state(false);
   let menuOpen = $state(false);
   let showRecipeManager = $state(false);
+  let bulkActionError: string | null = $state(null);
+  let bulkActionNotice: string | null = $state(null);
+  const fallbackContainers = [
+    "vllm-next:latest",
+    "vllm-node:latest",
+    "vllm-node-12.0f:latest",
+    "vllm-node-mxfp4:latest",
+  ];
+  let availableContainers = $state<string[]>(fallbackContainers);
 
   const showUnlistedStore = persistentStore<boolean>("showUnlisted", true);
   const showIdorNameStore = persistentStore<"id" | "name">("showIdorName", "id");
@@ -57,12 +70,45 @@
     };
   });
 
+  // Close dropdowns when clicking outside
+  function handleClickOutside(event: MouseEvent) {
+    const target = event.target as Element;
+    if (!target.closest('.model-container-selector')) {
+      document.querySelectorAll('.container-dropdown.open').forEach(dropdown => {
+        dropdown.classList.remove('open');
+      });
+    }
+  }
+
+  async function loadAvailableContainers(): Promise<void> {
+    try {
+      const containers = await getDockerContainers();
+      availableContainers = containers.length > 0 ? containers : fallbackContainers;
+    } catch (error) {
+      console.error("Failed to load containers:", error);
+      availableContainers = fallbackContainers;
+    }
+  }
+
+  onMount(() => {
+    document.addEventListener('click', handleClickOutside);
+    void loadAvailableContainers();
+  });
+
+  onDestroy(() => {
+    document.removeEventListener("click", handleClickOutside);
+  });
+
   async function handleUnloadAllModels(): Promise<void> {
     isUnloading = true;
+    bulkActionError = null;
+    bulkActionNotice = null;
     try {
       await unloadAllModels();
+      bulkActionNotice = "Unload All completed.";
     } catch (e) {
       console.error(e);
+      bulkActionError = e instanceof Error ? e.message : String(e);
     } finally {
       setTimeout(() => (isUnloading = false), 1000);
     }
@@ -70,10 +116,14 @@
 
   async function handleStopCluster(): Promise<void> {
     isStoppingCluster = true;
+    bulkActionError = null;
+    bulkActionNotice = null;
     try {
-      await stopClusterAndUnload();
+      await stopCluster();
+      bulkActionNotice = "Stop Cluster completed.";
     } catch (e) {
       console.error(e);
+      bulkActionError = e instanceof Error ? e.message : String(e);
     } finally {
       setTimeout(() => (isStoppingCluster = false), 1000);
     }
@@ -197,6 +247,46 @@
       benchyError = e instanceof Error ? e.message : String(e);
     }
   }
+
+  async function updateModelContainer(modelId: string, container: string): Promise<void> {
+    try {
+      // Get current recipe state for this model
+      const state = await getRecipeUIState();
+      const modelRecipe = state.models.find(m => m.modelId === modelId);
+
+      if (!modelRecipe) {
+        throw new Error(`Model ${modelId} is not a recipe-managed model`);
+      }
+
+      // Update the model with the new container
+      await upsertRecipeModel({
+        modelId,
+        recipeRef: modelRecipe.recipeRef,
+        name: modelRecipe.name,
+        description: modelRecipe.description,
+        aliases: modelRecipe.aliases,
+        useModelName: modelRecipe.useModelName,
+        mode: modelRecipe.mode,
+        tensorParallel: modelRecipe.tensorParallel,
+        nodes: modelRecipe.nodes,
+        extraArgs: modelRecipe.extraArgs,
+        group: modelRecipe.group,
+        unlisted: modelRecipe.unlisted,
+        containerImage: container,
+        nonPrivileged: modelRecipe.nonPrivileged,
+        memLimitGb: modelRecipe.memLimitGb,
+        memSwapLimitGb: modelRecipe.memSwapLimitGb,
+        pidsLimit: modelRecipe.pidsLimit,
+        shmSizeGb: modelRecipe.shmSizeGb,
+      });
+
+      // Show success feedback
+      return;
+    } catch (error) {
+      console.error('Failed to update container:', error);
+      throw error;
+    }
+  }
 </script>
 
 <div class="card h-full flex flex-col">
@@ -314,6 +404,7 @@
           </button>
         </div>
       </div>
+
       <div class="mt-2">
         <button class="btn text-base flex items-center gap-2" onclick={toggleRecipeManager}>
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
@@ -329,6 +420,13 @@
     <div class="shrink-0">
       <RecipeManager />
     </div>
+  {/if}
+
+  {#if bulkActionError}
+    <div class="mt-2 p-2 border border-red-400/30 bg-red-600/10 rounded text-sm text-red-300 break-words">{bulkActionError}</div>
+  {/if}
+  {#if bulkActionNotice}
+    <div class="mt-2 p-2 border border-green-400/30 bg-green-600/10 rounded text-sm text-green-300 break-words">{bulkActionNotice}</div>
   {/if}
 
   <div class="flex-1 overflow-y-auto">
@@ -351,13 +449,15 @@
                 <p class={model.unlisted ? "text-opacity-70" : ""}><em>{model.description}</em></p>
               {/if}
             </td>
-            <td class="w-44">
-              <div class="flex justify-end gap-2">
+            <td class="w-auto">
+              <div class="flex justify-end gap-2 items-center flex-wrap">
                 {#if model.state === "stopped"}
                   <button class="btn btn--sm" onclick={() => loadModel(model.id)} disabled={benchyBusy}>Load</button>
                 {:else}
                   <button class="btn btn--sm" onclick={() => unloadSingleModel(model.id)} disabled={model.state !== "ready" || benchyBusy}>Unload</button>
                 {/if}
+
+
                 <button
                   class="btn btn--sm"
                   onclick={() => openBenchyForModel(model.id)}
@@ -413,3 +513,127 @@
   onclose={closeBenchyDialog}
   oncancel={cancelBenchy}
 />
+
+<style>
+  .model-container-selector {
+    position: relative;
+    display: inline-block;
+  }
+
+  .btn-container-selector {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.375rem 0.5rem;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border: 1px solid #5a67d8;
+    border-radius: 0.375rem;
+    color: white;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    min-width: 2rem;
+  }
+
+  .btn-container-selector:hover {
+    background: linear-gradient(135deg, #5a67d8 0%, #6b46c1 100%);
+    border-color: #4c51bf;
+    transform: scale(1.05);
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+  }
+
+  .btn-container-selector.just-selected {
+    background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+    border-color: #2f855a;
+    animation: pulse 0.5s ease-in-out;
+  }
+
+  @keyframes pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.1); }
+  }
+
+  .container-dropdown {
+    position: absolute;
+    top: calc(100% + 0.25rem);
+    right: 0;
+    z-index: 50;
+    min-width: 16rem;
+    background: white;
+    border: 1px solid #e2e8f0;
+    border-radius: 0.5rem;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-0.5rem);
+    transition: all 0.2s ease;
+  }
+
+  .container-dropdown.open {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+  }
+
+  .container-dropdown-header {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #e2e8f0;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    font-weight: 600;
+    font-size: 0.875rem;
+    border-radius: 0.5rem 0.5rem 0 0;
+  }
+
+  .container-dropdown-items {
+    max-height: 16rem;
+    overflow-y: auto;
+    padding: 0.5rem;
+  }
+
+  .container-dropdown-item {
+    padding: 0.625rem 0.75rem;
+    cursor: pointer;
+    border-radius: 0.375rem;
+    transition: all 0.2s ease;
+    border: 1px solid transparent;
+  }
+
+  .container-dropdown-item:hover {
+    background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%);
+    border-color: #cbd5e0;
+    transform: translateX(0.125rem);
+  }
+
+  .container-tag {
+    display: block;
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #2d3748;
+    padding: 0.25rem 0.5rem;
+    background: linear-gradient(135deg, #edf2f7 0%, #e2e8f0 100%);
+    border-radius: 0.25rem;
+    border: 1px solid #cbd5e0;
+  }
+
+  /* Dark mode support */
+  :global([data-theme="dark"]) .container-dropdown {
+    background: #2d3748;
+    border-color: #4a5568;
+  }
+
+  :global([data-theme="dark"]) .container-dropdown-header {
+    background: linear-gradient(135deg, #553c9a 0%, #44337a 100%);
+  }
+
+  :global([data-theme="dark"]) .container-dropdown-item:hover {
+    background: linear-gradient(135deg, #4a5568 0%, #2d3748 100%);
+    border-color: #718096;
+  }
+
+  :global([data-theme="dark"]) .container-tag {
+    color: #e2e8f0;
+    background: linear-gradient(135deg, #4a5568 0%, #2d3748 100%);
+    border-color: #718096;
+  }
+</style>

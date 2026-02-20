@@ -158,11 +158,6 @@
       return;
     }
 
-    const confirmed = window.confirm(
-      `Se ejecutará UpdateAndReboot solo en el nodo:\n${nodeIP}\n\nEl proceso puede terminar en reboot automático.`
-    );
-    if (!confirmed) return;
-
     await executeDgxUpdate([nodeIP]);
   }
 

@@ -235,15 +235,6 @@ func clusterAutodiscoverPath() string {
 		return primary
 	}
 
-	// Compatibility fallback: spark-vllm-docker-nvidia may not include autodiscover.sh
-	backendBase := strings.ToLower(filepath.Base(backendDir))
-	if strings.Contains(backendBase, "spark-vllm-docker-nvidia") {
-		fallback := filepath.Join(filepath.Dir(backendDir), "spark-vllm-docker", "autodiscover.sh")
-		if clusterFileExists(fallback) {
-			return fallback
-		}
-	}
-
 	return primary
 }
 

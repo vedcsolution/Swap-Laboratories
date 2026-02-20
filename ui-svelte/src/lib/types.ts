@@ -155,10 +155,19 @@ export interface RecipeManagedModel {
   tensorParallel: number;
   nodes?: string;
   extraArgs?: string;
+  containerImage?: string;
+  metadata?: {
+    container_image?: string;
+  };
   group: string;
   unlisted?: boolean;
   managed: boolean;
   benchyTrustRemoteCode?: boolean;
+  nonPrivileged?: boolean;
+  memLimitGb?: number;
+  memSwapLimitGb?: number;
+  pidsLimit?: number;
+  shmSizeGb?: number;
 }
 
 export interface RecipeUIState {
@@ -170,17 +179,21 @@ export interface RecipeUIState {
 }
 
 export type RecipeBackendSource = "override" | "env" | "default";
-export type RecipeBackendKind = "vllm" | "sqlang" | "trtllm" | "nvidia" | "custom";
+export type RecipeBackendKind = "vllm" | "sqlang" | "trtllm" | "nvidia" | "llamacpp" | "custom";
 
 export type RecipeBackendAction =
   | "git_pull"
   | "git_pull_rebase"
   | "build_vllm"
   | "build_mxfp4"
+  | "build_vllm_12_0f"
   | "pull_trtllm_image"
   | "update_trtllm_image"
   | "pull_nvidia_image"
-  | "update_nvidia_image";
+  | "update_nvidia_image"
+  | "pull_llamacpp_image"
+  | "update_llamacpp_image"
+  | "download_hf_model";
 
 export interface RecipeBackendActionInfo {
   action: RecipeBackendAction | string;
@@ -206,6 +219,13 @@ export interface RecipeBackendNVIDIAImage {
   warning?: string;
 }
 
+export interface RecipeBackendLLAMACPPImage {
+  selected: string;
+  default: string;
+  available?: string[];
+  warning?: string;
+}
+
 export interface RecipeBackendState {
   backendDir: string;
   backendSource: RecipeBackendSource;
@@ -217,6 +237,20 @@ export interface RecipeBackendState {
   actions: RecipeBackendActionInfo[];
   trtllmImage?: RecipeBackendTRTLLMImage;
   nvidiaImage?: RecipeBackendNVIDIAImage;
+  llamacppImage?: RecipeBackendLLAMACPPImage;
+}
+
+export interface RecipeBackendHFModel {
+  cacheDir: string;
+  modelId: string;
+  path: string;
+  sizeBytes: number;
+  modifiedAt: string;
+}
+
+export interface RecipeBackendHFModelsState {
+  hubPath: string;
+  models: RecipeBackendHFModel[];
 }
 
 export interface RecipeBackendActionResponse {
@@ -243,6 +277,12 @@ export interface RecipeUpsertRequest {
   unlisted?: boolean;
   benchyTrustRemoteCode?: boolean;
   hotSwap?: boolean;
+  containerImage?: string;
+  nonPrivileged?: boolean;
+  memLimitGb?: number;
+  memSwapLimitGb?: number;
+  pidsLimit?: number;
+  shmSizeGb?: number;
 }
 
 export interface ConfigEditorState {

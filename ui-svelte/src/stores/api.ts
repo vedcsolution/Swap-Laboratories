@@ -12,6 +12,7 @@ import type {
   RecipeBackendState,
   RecipeBackendAction,
   RecipeBackendActionResponse,
+  RecipeBackendHFModelsState,
   RecipeUIState,
   RecipeUpsertRequest,
   ConfigEditorState,
@@ -163,7 +164,7 @@ export async function unloadAllModels(): Promise<void> {
   }
 }
 
-export async function stopClusterAndUnload(): Promise<void> {
+export async function stopCluster(): Promise<void> {
   try {
     const response = await fetch(`/api/cluster/stop`, {
       method: "POST",
@@ -305,7 +306,7 @@ export async function setRecipeBackend(backendDir: string): Promise<RecipeBacken
 
 export async function runRecipeBackendAction(
   action: RecipeBackendAction,
-  opts?: { sourceImage?: string },
+  opts?: { sourceImage?: string; hfModel?: string },
 ): Promise<RecipeBackendActionResponse> {
   const response = await fetch(`/api/recipes/backend/action`, {
     method: "POST",
@@ -315,6 +316,7 @@ export async function runRecipeBackendAction(
     body: JSON.stringify({
       action,
       sourceImage: opts?.sourceImage,
+      hfModel: opts?.hfModel,
     }),
   });
 
@@ -334,6 +336,30 @@ export async function runRecipeBackendAction(
   }
 
   return (parsed || {}) as RecipeBackendActionResponse;
+}
+
+export async function getRecipeBackendHFModels(signal?: AbortSignal): Promise<RecipeBackendHFModelsState> {
+  const response = await fetch(`/api/recipes/backend/hf-models`, { signal });
+  if (!response.ok) {
+    const msg = await response.text().catch(() => "");
+    throw new Error(msg || `Failed to fetch HF models: ${response.status}`);
+  }
+  return (await response.json()) as RecipeBackendHFModelsState;
+}
+
+export async function deleteRecipeBackendHFModel(cacheDir: string): Promise<RecipeBackendHFModelsState> {
+  const response = await fetch(`/api/recipes/backend/hf-models`, {
+    method: "DELETE",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ cacheDir }),
+  });
+  if (!response.ok) {
+    const msg = await response.text().catch(() => "");
+    throw new Error(msg || `Failed to delete HF model: ${response.status}`);
+  }
+  return (await response.json()) as RecipeBackendHFModelsState;
 }
 
 export async function upsertRecipeModel(payload: RecipeUpsertRequest): Promise<RecipeUIState> {
@@ -400,6 +426,39 @@ export async function getCapture(id: number): Promise<ReqRespCapture | null> {
     console.error("Failed to fetch capture:", error);
     return null;
   }
+}
+
+export async function getDockerContainers(): Promise<string[]> {
+  const response = await fetch("/api/recipes/containers");
+  if (!response.ok) {
+    throw new Error(`Failed to fetch docker containers: ${response.status}`);
+  }
+  return await response.json();
+}
+
+export async function getSelectedContainer(): Promise<string> {
+  const response = await fetch("/api/recipes/selected-container");
+  if (!response.ok) {
+    throw new Error(`Failed to fetch selected container: ${response.status}`);
+  }
+  const data = await response.json();
+  return data.selectedContainer || "vllm-node:latest";
+}
+
+export async function setSelectedContainer(container: string): Promise<string> {
+  const response = await fetch("/api/recipes/selected-container", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ container }),
+  });
+  if (!response.ok) {
+    const msg = await response.text().catch(() => "");
+    throw new Error(msg || `Failed to set selected container: ${response.status}`);
+  }
+  const data = await response.json();
+  return data.selectedContainer;
 }
 
 export async function getClusterStatus(signal?: AbortSignal): Promise<ClusterStatusState> {

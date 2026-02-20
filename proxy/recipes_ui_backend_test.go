@@ -3,6 +3,7 @@ package proxy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -12,8 +13,9 @@ func TestDetectRecipeBackendKind(t *testing.T) {
 		want string
 	}{
 		{path: "/home/u/spark-vllm-docker", want: "vllm"},
-		{path: "/home/u/spark-sqlang-docker", want: "sqlang"},
-		{path: "/home/u/spark-trtllm-docker", want: "trtllm"},
+		{path: "/home/u/sqlang-backend", want: "sqlang"},
+		{path: "/home/u/trtllm-backend", want: "trtllm"},
+		{path: "/home/u/spark-llama-cpp", want: "llamacpp"},
 		{path: "/opt/custom-backend", want: "custom"},
 	}
 
@@ -67,6 +69,20 @@ func TestResolveTRTLLMSourceImagePrefersOverrideFile(t *testing.T) {
 	got := resolveTRTLLMSourceImage(dir, "")
 	if got != overrideValue {
 		t.Fatalf("resolveTRTLLMSourceImage() = %q, want %q", got, overrideValue)
+	}
+}
+
+func TestResolveLLAMACPPSourceImagePrefersOverrideFile(t *testing.T) {
+	dir := t.TempDir()
+	overridePath := filepath.Join(dir, llamacppSourceImageOverrideFile)
+	overrideValue := "llama-cpp-spark:custom"
+	if err := os.WriteFile(overridePath, []byte(overrideValue+"\n"), 0o644); err != nil {
+		t.Fatalf("write override: %v", err)
+	}
+
+	got := resolveLLAMACPPSourceImage(dir, "")
+	if got != overrideValue {
+		t.Fatalf("resolveLLAMACPPSourceImage() = %q, want %q", got, overrideValue)
 	}
 }
 
@@ -141,8 +157,8 @@ func TestRecipeManagedModelInCatalog(t *testing.T) {
 }
 
 func TestRecipeEntryTargetsActiveBackend(t *testing.T) {
-	active := filepath.Join(t.TempDir(), "spark-vllm-docker-nvidia")
-	other := filepath.Join(t.TempDir(), "spark-vllm-docker")
+	active := filepath.Join(t.TempDir(), "backend-active")
+	other := filepath.Join(t.TempDir(), "backend-other")
 
 	if !recipeEntryTargetsActiveBackend(nil, active) {
 		t.Fatalf("nil metadata should be allowed")
@@ -160,4 +176,34 @@ func TestRecipeEntryTargetsActiveBackend(t *testing.T) {
 	if recipeEntryTargetsActiveBackend(metaOther, active) {
 		t.Fatalf("different backend_dir should be filtered out")
 	}
+}
+
+func TestResolveHFDownloadScriptPathPrefersEnv(t *testing.T) {
+	temp := t.TempDir()
+	script := filepath.Join(temp, "hf-download.sh")
+	t.Setenv(hfDownloadScriptPathEnv, script)
+
+	if got := resolveHFDownloadScriptPath(); got != script {
+		t.Fatalf("resolveHFDownloadScriptPath() = %q, want %q", got, script)
+	}
+}
+
+func TestRecipeBackendActionsForKindIncludesHFDownload(t *testing.T) {
+	temp := t.TempDir()
+	script := filepath.Join(temp, "hf-download.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	t.Setenv(hfDownloadScriptPathEnv, script)
+
+	actions := recipeBackendActionsForKind("vllm", temp, "")
+	for _, action := range actions {
+		if action.Action == "download_hf_model" {
+			if !strings.Contains(action.CommandHint, script) {
+				t.Fatalf("download_hf_model commandHint missing script path: %q", action.CommandHint)
+			}
+			return
+		}
+	}
+	t.Fatalf("download_hf_model action not found")
 }
