@@ -2,12 +2,13 @@
   import { onMount } from "svelte";
   import {
     deleteRecipeBackendHFModel,
+    getRecipeBackendActionStatus,
     getRecipeBackendHFModels,
     getRecipeBackendState,
     runRecipeBackendAction,
     setRecipeBackend,
   } from "../stores/api";
-  import type { RecipeBackendAction, RecipeBackendHFModel, RecipeBackendState } from "../lib/types";
+  import type { RecipeBackendAction, RecipeBackendActionStatus, RecipeBackendHFModel, RecipeBackendState } from "../lib/types";
   import { collapseHomePath } from "../lib/pathDisplay";
 
   let loading = $state(true);
@@ -30,6 +31,8 @@
   let deletingHFModel = $state("");
   let hfHubPath = $state("");
   let hfModels = $state<RecipeBackendHFModel[]>([]);
+  let backendActionStatus = $state<RecipeBackendActionStatus | null>(null);
+  let actionStatusTimer: ReturnType<typeof setInterval> | null = null;
   let refreshController: AbortController | null = null;
 
   function sourceLabel(source: RecipeBackendState["backendSource"]): string {
@@ -168,6 +171,45 @@
     }
   }
 
+  function actionStateLabel(state: string | undefined): string {
+    if (state === "success") return "success";
+    if (state === "failed") return "failed";
+    if (state === "running") return "running";
+    return "idle";
+  }
+
+  function isBackendActionRunning(action?: string): boolean {
+    if (!backendActionStatus?.running) return false;
+    if (!action) return true;
+    return backendActionStatus.action === action;
+  }
+
+  async function refreshBackendActionStatus(signal?: AbortSignal): Promise<void> {
+    try {
+      const previous = backendActionStatus;
+      const next = await getRecipeBackendActionStatus(signal);
+      backendActionStatus = next;
+
+      if (next.command) {
+        actionCommand = next.command;
+      }
+      if (!next.running && next.output) {
+        actionOutput = next.output;
+      }
+
+      if (previous?.running && !next.running && next.action === "download_hf_model") {
+        await refreshHFModels(signal);
+        if (next.state === "success") {
+          notice = `Descarga completada en ${formatDuration(next.durationMs || 0)}.`;
+        } else if (next.state === "failed" && next.error) {
+          error = next.error;
+        }
+      }
+    } catch {
+      // Keep backend page functional even if status endpoint is unavailable.
+    }
+  }
+
   function formatBytes(bytes: number): string {
     if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
     const units = ["B", "KB", "MB", "GB", "TB"];
@@ -233,6 +275,7 @@
       state = next;
       syncSelectionFromState(next);
       await refreshHFModels(controller.signal);
+      await refreshBackendActionStatus(controller.signal);
     } catch (e) {
       if (controller.signal.aborted) {
         error = "Timeout consultando backend. Pulsa Refresh para reintentar.";
@@ -281,12 +324,32 @@
   }
 
   async function runAction(action: string, label: string): Promise<void> {
-    if (actionRunning) return;
-    actionRunning = action;
+    const isDownload = action === "download_hf_model";
+    if (!isDownload && actionRunning) return;
+    if (isDownload && isBackendActionRunning("download_hf_model")) {
+      error = "Ya hay una descarga en progreso. Espera a que termine.";
+      return;
+    }
+
+    if (!isDownload) {
+      actionRunning = action;
+    }
+
     error = null;
     notice = null;
     actionCommand = "";
     actionOutput = "";
+
+    if (isDownload) {
+      backendActionStatus = {
+        running: true,
+        action,
+        state: "running",
+        backendDir: state?.backendDir,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    }
 
     try {
       const sourceImage =
@@ -305,7 +368,12 @@
       const result = await runRecipeBackendAction(action as RecipeBackendAction, opts);
       actionCommand = result.command || "";
       actionOutput = result.output || "";
-      notice = `${label} completado en ${formatDuration(result.durationMs || 0)}.`;
+      notice = result.message || `${label} completado en ${formatDuration(result.durationMs || 0)}.`;
+
+      if (isDownload) {
+        await refreshBackendActionStatus();
+      }
+
       if (
         action === "git_pull" ||
         action === "git_pull_rebase" ||
@@ -314,22 +382,33 @@
         action === "pull_nvidia_image" ||
         action === "update_nvidia_image" ||
         action === "pull_llamacpp_image" ||
-        action === "update_llamacpp_image" ||
-        action === "download_hf_model"
+        action === "update_llamacpp_image"
       ) {
         await refresh();
       }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
+      await refreshBackendActionStatus();
     } finally {
-      actionRunning = "";
+      if (!isDownload) {
+        actionRunning = "";
+      }
     }
   }
 
+
   onMount(() => {
     void refresh();
+    actionStatusTimer = setInterval(() => {
+      void refreshBackendActionStatus();
+    }, 3000);
+
     return () => {
       refreshController?.abort();
+      if (actionStatusTimer) {
+        clearInterval(actionStatusTimer);
+        actionStatusTimer = null;
+      }
     };
   });
 </script>
@@ -529,6 +608,37 @@
       <div class="mt-4 pt-3 border-t border-card-border">
         <div class="text-sm text-txtsecondary mb-2">Backend actions</div>
 
+        {#if isBackendActionRunning()}
+          <div class="mb-3 p-2 border border-amber-500/30 bg-amber-500/10 rounded text-xs text-amber-300 break-words space-y-1">
+            <div>
+              Acción en progreso:
+              <span class="font-mono">{runningLabel(backendActionStatus?.action || "")}</span>
+            </div>
+            <div>
+              Inicio:
+              <span class="font-mono">{backendActionStatus?.startedAt || "-"}</span>
+            </div>
+          </div>
+        {:else if backendActionStatus?.action}
+          <div class="mb-3 p-2 border border-card-border rounded bg-background/40 text-xs text-txtsecondary break-words space-y-1">
+            <div>
+              Última acción:
+              <span class="font-mono">{backendActionStatus.action}</span>
+            </div>
+            <div>
+              Estado:
+              <span class="font-mono">{actionStateLabel(backendActionStatus.state)}</span>
+              {#if backendActionStatus.durationMs}
+                | duración: <span class="font-mono">{formatDuration(backendActionStatus.durationMs)}</span>
+              {/if}
+            </div>
+            <div>
+              Actualizado:
+              <span class="font-mono">{backendActionStatus.updatedAt || "-"}</span>
+            </div>
+          </div>
+        {/if}
+
         {#if hfDownloadAction(state)}
           <div class="mb-3 p-3 border border-card-border rounded bg-background/40 space-y-2">
             <div class="text-sm text-txtsecondary">Descargar modelo desde Hugging Face</div>
@@ -536,10 +646,10 @@
             <button
               class="btn btn--sm"
               onclick={() => runAction("download_hf_model", hfDownloadAction(state)?.label || "Download HF Model")}
-              disabled={!!actionRunning || saving || refreshing}
+              disabled={isBackendActionRunning("download_hf_model") || saving || !!deletingHFModel}
               title={hfDownloadAction(state)?.commandHint || "Download HF Model"}
             >
-              {actionRunning === "download_hf_model"
+              {isBackendActionRunning("download_hf_model")
                 ? runningLabel("download_hf_model")
                 : (hfDownloadAction(state)?.label || "Download HF Model")}
             </button>
@@ -571,7 +681,7 @@
                     <button
                       class="btn btn--sm"
                       onclick={() => deleteHFModel(model)}
-                      disabled={!!actionRunning || saving || refreshing || !!deletingHFModel}
+                      disabled={saving || !!deletingHFModel}
                       title={`Eliminar ${model.modelId || model.cacheDir}`}
                     >
                       {deletingHFModel === model.cacheDir ? "Eliminando..." : "Eliminar"}
@@ -593,10 +703,10 @@
               <button
                 class="btn btn--sm"
                 onclick={() => runAction(info.action, info.label)}
-                disabled={!!actionRunning || saving || refreshing}
+                disabled={!!actionRunning || saving || refreshing || isBackendActionRunning()}
                 title={info.commandHint || info.label}
               >
-                {actionRunning === info.action ? runningLabel(info.action) : info.label}
+                {(actionRunning === info.action || isBackendActionRunning(info.action)) ? runningLabel(info.action) : info.label}
               </button>
             {/each}
           </div>

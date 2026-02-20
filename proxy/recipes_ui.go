@@ -206,6 +206,19 @@ type recipeBackendActionResponse struct {
 	DurationMs int64  `json:"durationMs"`
 }
 
+type recipeBackendActionStatus struct {
+	Running    bool   `json:"running"`
+	Action     string `json:"action,omitempty"`
+	BackendDir string `json:"backendDir,omitempty"`
+	Command    string `json:"command,omitempty"`
+	State      string `json:"state,omitempty"`
+	StartedAt  string `json:"startedAt,omitempty"`
+	UpdatedAt  string `json:"updatedAt,omitempty"`
+	DurationMs int64  `json:"durationMs,omitempty"`
+	Output     string `json:"output,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
 type recipeBackendHFModel struct {
 	CacheDir   string `json:"cacheDir"`
 	ModelID    string `json:"modelId"`
@@ -234,6 +247,10 @@ func (pm *ProxyManager) apiGetRecipeState(c *gin.Context) {
 
 func (pm *ProxyManager) apiGetRecipeBackend(c *gin.Context) {
 	c.JSON(http.StatusOK, pm.recipeBackendState())
+}
+
+func (pm *ProxyManager) apiGetRecipeBackendActionStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, pm.recipeBackendActionStatusSnapshot())
 }
 
 func (pm *ProxyManager) apiSetRecipeBackend(c *gin.Context) {
@@ -383,7 +400,7 @@ func (pm *ProxyManager) apiDeleteRecipeBackendHFModel(c *gin.Context) {
 		return
 	}
 
-	if err := os.RemoveAll(targetAbs); err != nil {
+	if err := removeHFModelDir(c.Request.Context(), targetAbs); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("delete failed: %v", err)})
 		return
 	}
@@ -432,15 +449,116 @@ func deleteHFModelFromPeerNodes(parentCtx context.Context, modelPath string) []s
 			continue
 		}
 
-		nodeCtx, cancelNode := context.WithTimeout(parentCtx, 20*time.Second)
-		_, runErr := runClusterNodeShell(nodeCtx, nodeIP, false, fmt.Sprintf("if [ -e %s ]; then rm -rf %s; fi", shellQuote(modelPath), shellQuote(modelPath)))
+		nodeCtx, cancelNode := context.WithTimeout(parentCtx, 30*time.Second)
+		peerScript := fmt.Sprintf(
+			"if [ -e %[1]s ]; then rm -rf %[1]s || sudo -n rm -rf %[1]s; fi",
+			shellQuote(modelPath),
+		)
+		_, runErr := runClusterNodeShell(nodeCtx, nodeIP, false, peerScript)
 		cancelNode()
 		if runErr != nil {
 			errorsList = append(errorsList, fmt.Sprintf("%s (%v)", nodeIP, runErr))
 		}
 	}
-
 	return errorsList
+}
+
+func removeHFModelDir(ctx context.Context, targetAbs string) error {
+	targetAbs = strings.TrimSpace(targetAbs)
+	if targetAbs == "" {
+		return fmt.Errorf("target path is empty")
+	}
+
+	if err := os.RemoveAll(targetAbs); err == nil {
+		return nil
+	} else {
+		if !errors.Is(err, fs.ErrPermission) {
+			return err
+		}
+	}
+
+	cmdCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, "sudo", "-n", "rm", "-rf", "--", targetAbs)
+	output, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		msg := strings.TrimSpace(string(output))
+		if msg == "" {
+			msg = runErr.Error()
+		}
+		return fmt.Errorf("permission denied and sudo cleanup failed: %s", msg)
+	}
+
+	if _, statErr := os.Stat(targetAbs); statErr == nil {
+		return fmt.Errorf("path still exists after sudo cleanup: %s", targetAbs)
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return statErr
+	}
+
+	return nil
+}
+
+func (pm *ProxyManager) beginRecipeBackendAction(action, backendDir, command string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	action = strings.TrimSpace(action)
+	backendDir = strings.TrimSpace(backendDir)
+	command = strings.TrimSpace(command)
+
+	pm.backendActionStatusMu.Lock()
+	defer pm.backendActionStatusMu.Unlock()
+
+	if pm.backendActionStatus.Running {
+		return fmt.Errorf("action %s is already running", pm.backendActionStatus.Action)
+	}
+
+	pm.backendActionStatus = recipeBackendActionStatus{
+		Running:    true,
+		Action:     action,
+		BackendDir: backendDir,
+		Command:    command,
+		State:      "running",
+		StartedAt:  now,
+		UpdatedAt:  now,
+	}
+	return nil
+}
+
+func (pm *ProxyManager) completeRecipeBackendAction(action, backendDir, command string, started time.Time, durationMs int64, outputText, errText string) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	action = strings.TrimSpace(action)
+	backendDir = strings.TrimSpace(backendDir)
+	command = strings.TrimSpace(command)
+	errText = strings.TrimSpace(errText)
+	state := "success"
+	if errText != "" {
+		state = "failed"
+	}
+
+	pm.backendActionStatusMu.Lock()
+	pm.backendActionStatus = recipeBackendActionStatus{
+		Running:    false,
+		Action:     action,
+		BackendDir: backendDir,
+		Command:    command,
+		State:      state,
+		StartedAt:  started.UTC().Format(time.RFC3339),
+		UpdatedAt:  now,
+		DurationMs: durationMs,
+		Output:     outputText,
+		Error:      errText,
+	}
+	pm.backendActionStatusMu.Unlock()
+}
+
+func (pm *ProxyManager) recipeBackendActionStatusSnapshot() recipeBackendActionStatus {
+	pm.backendActionStatusMu.Lock()
+	status := pm.backendActionStatus
+	pm.backendActionStatusMu.Unlock()
+	if status.UpdatedAt == "" {
+		status.State = "idle"
+	}
+	return status
 }
 
 func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
@@ -712,7 +830,7 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 			return
 		}
 		commandText = fmt.Sprintf("%s %s -c --copy-parallel", scriptPath, hfModel)
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Hour)
 		defer cancel()
 		cmd = exec.CommandContext(ctx, scriptPath, hfModel, "-c", "--copy-parallel")
 		cmd.Dir = filepath.Dir(scriptPath)
@@ -733,6 +851,11 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 		return
 	}
 
+	if beginErr := pm.beginRecipeBackendAction(action, backendDir, commandText); beginErr != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": beginErr.Error()})
+		return
+	}
+
 	started := time.Now()
 	output, err := cmd.CombinedOutput()
 	durationMs := time.Since(started).Milliseconds()
@@ -740,6 +863,7 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 	outputText = tailString(outputText, 120000)
 
 	if err != nil {
+		pm.completeRecipeBackendAction(action, backendDir, commandText, started, durationMs, outputText, err.Error())
 		pm.proxyLogger.Errorf("backend action failed action=%s dir=%s err=%v", action, backendDir, err)
 		errMsg := fmt.Sprintf("action %s failed: %v", action, err)
 		if action == "git_pull" {
@@ -766,6 +890,7 @@ func (pm *ProxyManager) apiRunRecipeBackendAction(c *gin.Context) {
 		_ = persistLLAMACPPSourceImage(backendDir, llamacppSourceImage)
 	}
 
+	pm.completeRecipeBackendAction(action, backendDir, commandText, started, durationMs, outputText, "")
 	pm.proxyLogger.Infof("backend action completed action=%s dir=%s durationMs=%d", action, backendDir, durationMs)
 	c.JSON(http.StatusOK, recipeBackendActionResponse{
 		Action:     action,

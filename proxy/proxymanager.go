@@ -68,6 +68,9 @@ type ProxyManager struct {
 	benchyCancels map[string]context.CancelFunc
 
 	rateLimiter *proxyRateLimiter
+
+	backendActionStatusMu sync.Mutex
+	backendActionStatus   recipeBackendActionStatus
 }
 
 func New(proxyConfig config.Config) *ProxyManager {

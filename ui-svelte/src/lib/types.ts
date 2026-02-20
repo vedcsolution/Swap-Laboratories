@@ -253,6 +253,19 @@ export interface RecipeBackendHFModelsState {
   models: RecipeBackendHFModel[];
 }
 
+export interface RecipeBackendActionStatus {
+  running: boolean;
+  action?: RecipeBackendAction | string;
+  backendDir?: string;
+  command?: string;
+  state?: "idle" | "running" | "success" | "failed" | string;
+  startedAt?: string;
+  updatedAt?: string;
+  durationMs?: number;
+  output?: string;
+  error?: string;
+}
+
 export interface RecipeBackendActionResponse {
   action: RecipeBackendAction | string;
   backendDir: string;

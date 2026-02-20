@@ -12,6 +12,7 @@ import type {
   RecipeBackendState,
   RecipeBackendAction,
   RecipeBackendActionResponse,
+  RecipeBackendActionStatus,
   RecipeBackendHFModelsState,
   RecipeUIState,
   RecipeUpsertRequest,
@@ -302,6 +303,15 @@ export async function setRecipeBackend(backendDir: string): Promise<RecipeBacken
     throw new Error(msg || `Failed to set recipe backend: ${response.status}`);
   }
   return (await response.json()) as RecipeBackendState;
+}
+
+export async function getRecipeBackendActionStatus(signal?: AbortSignal): Promise<RecipeBackendActionStatus> {
+  const response = await fetch(`/api/recipes/backend/action-status`, { signal });
+  if (!response.ok) {
+    const msg = await response.text().catch(() => "");
+    throw new Error(msg || `Failed to fetch backend action status: ${response.status}`);
+  }
+  return (await response.json()) as RecipeBackendActionStatus;
 }
 
 export async function runRecipeBackendAction(
