@@ -207,3 +207,44 @@ func TestRecipeBackendActionsForKindIncludesHFDownload(t *testing.T) {
 	}
 	t.Fatalf("download_hf_model action not found")
 }
+
+func TestResolveLLAMACPPHFDownloadScriptPathPrefersEnv(t *testing.T) {
+	temp := t.TempDir()
+	script := filepath.Join(temp, "llamacpp-hf-download.sh")
+	t.Setenv(llamacppHFDownloadScriptPathEnv, script)
+
+	if got := resolveLLAMACPPHFDownloadScriptPath(); got != script {
+		t.Fatalf("resolveLLAMACPPHFDownloadScriptPath() = %q, want %q", got, script)
+	}
+}
+
+func TestRecipeBackendActionsForKindIncludesLLAMACPPQuickDownload(t *testing.T) {
+	temp := t.TempDir()
+	hfScript := filepath.Join(temp, "hf-download.sh")
+	if err := os.WriteFile(hfScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write hf script: %v", err)
+	}
+	llamaScript := filepath.Join(temp, "llamacpp-hf-download.sh")
+	if err := os.WriteFile(llamaScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write llamacpp script: %v", err)
+	}
+	t.Setenv(hfDownloadScriptPathEnv, hfScript)
+	t.Setenv(llamacppHFDownloadScriptPathEnv, llamaScript)
+
+	actions := recipeBackendActionsForKind("llamacpp", temp, "")
+	for _, action := range actions {
+		if action.Action == "download_llamacpp_q8_model" {
+			if !strings.Contains(action.CommandHint, llamaScript) {
+				t.Fatalf("download_llamacpp_q8_model commandHint missing script path: %q", action.CommandHint)
+			}
+			if !strings.Contains(action.CommandHint, defaultLLAMACPPHFModel) {
+				t.Fatalf("download_llamacpp_q8_model commandHint missing model: %q", action.CommandHint)
+			}
+			if !strings.Contains(action.CommandHint, defaultLLAMACPPHFIncludePattern) {
+				t.Fatalf("download_llamacpp_q8_model commandHint missing include pattern: %q", action.CommandHint)
+			}
+			return
+		}
+	}
+	t.Fatalf("download_llamacpp_q8_model action not found")
+}

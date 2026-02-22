@@ -4,30 +4,30 @@
   import type { RecipeManagedModel, RecipeUIState } from "../lib/types";
   import { collapseHomePath } from "../lib/pathDisplay";
 
-  let loading = $state(true);
-  let saving = $state(false);
-  let error = $state<string | null>(null);
-  let notice = $state<string | null>(null);
+  let loading = true;
+  let saving = false;
+  let error: string | null = null;
+  let notice: string | null = null;
 
-  let state = $state<RecipeUIState | null>(null);
-  let selectedModelID = $state<string>("");
+  let state: RecipeUIState | null = null;
+  let selectedModelID = "";
 
-  let modelId = $state("");
-  let recipeRef = $state("");
-  let name = $state("");
-  let description = $state("");
-  let aliasesCsv = $state("");
-  let useModelName = $state("");
-  let mode = $state<"solo" | "cluster">("cluster");
-  let tensorParallel = $state<number>(2);
-  let nodes = $state("");
-  let extraArgs = $state("");
-  let group = $state("managed-recipes");
-  let unlisted = $state(false);
-  let benchyTrustRemoteCode = $state<"auto" | "true" | "false">("auto");
-  let hotSwap = $state(false);
-  let containerImage = $state("");
-  let availableContainers = $state<string[]>([]);
+  let modelId = "";
+  let recipeRef = "";
+  let name = "";
+  let description = "";
+  let aliasesCsv = "";
+  let useModelName = "";
+  let mode: "solo" | "cluster" = "cluster";
+  let tensorParallel = 2;
+  let nodes = "";
+  let extraArgs = "";
+  let group = "managed-recipes";
+  let unlisted = false;
+  let benchyTrustRemoteCode: "auto" | "true" | "false" = "auto";
+  let hotSwap = false;
+  let containerImage = "";
+  let availableContainers: string[] = [];
   let refreshController: AbortController | null = null;
 
   function clearForm(): void {
@@ -326,19 +326,21 @@
               <th class="px-2 py-1">Model ID</th>
               <th class="px-2 py-1">Recipe</th>
               <th class="px-2 py-1">Mode</th>
+              <th class="px-2 py-1">TP</th>
               <th class="px-2 py-1">Group</th>
               <th class="px-2 py-1">Actions</th>
             </tr>
           </thead>
           <tbody>
             {#if (state?.models.length || 0) === 0}
-              <tr><td class="px-2 py-2 text-txtsecondary" colspan="5">No recipe models yet.</td></tr>
+              <tr><td class="px-2 py-2 text-txtsecondary" colspan="6">No recipe models yet.</td></tr>
             {:else}
               {#each state?.models || [] as m (m.modelId)}
                 <tr class="border-t border-card-border">
                   <td class="px-2 py-1 font-mono">{m.modelId}</td>
                   <td class="px-2 py-1 font-mono">{m.recipeRef}</td>
                   <td class="px-2 py-1">{m.mode}</td>
+                  <td class="px-2 py-1">{m.tensorParallel || 1}</td>
                   <td class="px-2 py-1">{m.group}</td>
                   <td class="px-2 py-1">
                     <div class="flex gap-1">

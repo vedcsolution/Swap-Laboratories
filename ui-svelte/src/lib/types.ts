@@ -10,6 +10,9 @@ export interface Model {
   unlisted: boolean;
   peerID: string;
   containerImage?: string;
+  recipeRef?: string;
+  mode?: "solo" | "cluster";
+  tensorParallel?: number;
 }
 
 export interface Metrics {
@@ -194,6 +197,7 @@ export type RecipeBackendAction =
   | "update_nvidia_image"
   | "pull_llamacpp_image"
   | "update_llamacpp_image"
+  | "download_llamacpp_q8_model"
   | "download_hf_model";
 
 export interface RecipeBackendActionInfo {

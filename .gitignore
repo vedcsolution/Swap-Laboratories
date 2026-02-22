@@ -26,3 +26,6 @@ secrets/
 # Node modules
 ui/node_modules/
 ui-svelte/node_modules/
+
+# Local backup artifacts
+*.bak.*

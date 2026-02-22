@@ -11,27 +11,29 @@
   import type { RecipeBackendAction, RecipeBackendActionStatus, RecipeBackendHFModel, RecipeBackendState } from "../lib/types";
   import { collapseHomePath } from "../lib/pathDisplay";
 
-  let loading = $state(true);
-  let refreshing = $state(false);
-  let saving = $state(false);
-  let error = $state<string | null>(null);
-  let notice = $state<string | null>(null);
-  let state = $state<RecipeBackendState | null>(null);
-  let selected = $state("");
-  let customPath = $state("");
-  let useCustom = $state(false);
-  let actionRunning = $state<string>("");
-  let actionCommand = $state("");
-  let actionOutput = $state("");
-  let selectedTrtllmImage = $state("");
-  let selectedNvidiaImage = $state("");
-  let selectedLlamacppImage = $state("");
-  let hfModelName = $state("QuantTrio/MiniMax-M2-AWQ");
-  let hfModelsLoading = $state(false);
-  let deletingHFModel = $state("");
-  let hfHubPath = $state("");
-  let hfModels = $state<RecipeBackendHFModel[]>([]);
-  let backendActionStatus = $state<RecipeBackendActionStatus | null>(null);
+  let loading = true;
+  let refreshing = false;
+  let saving = false;
+  let error: string | null = null;
+  let notice: string | null = null;
+  let state: RecipeBackendState | null = null;
+  let selected = "";
+  let customPath = "";
+  let useCustom = false;
+  let actionRunning = "";
+  let actionCommand = "";
+  let actionOutput = "";
+  let selectedTrtllmImage = "";
+  let selectedNvidiaImage = "";
+  let selectedLlamacppImage = "";
+  let hfModelName = "QuantTrio/MiniMax-M2-AWQ";
+  const llamacppQuickModel = "unsloth/Qwen3-Next-80B-A3B-Thinking-GGUF";
+  const llamacppQuickQuant = "Q8_0";
+  let hfModelsLoading = false;
+  let deletingHFModel = "";
+  let hfHubPath = "";
+  let hfModels: RecipeBackendHFModel[] = [];
+  let backendActionStatus: RecipeBackendActionStatus | null = null;
   let actionStatusTimer: ReturnType<typeof setInterval> | null = null;
   let refreshController: AbortController | null = null;
 
@@ -135,9 +137,14 @@
     return next.actions.find((info) => info.action === "download_hf_model") || null;
   }
 
-  function backendActionsWithoutHF(next: RecipeBackendState | null): RecipeBackendState["actions"] {
+  function llamacppQuickDownloadAction(next: RecipeBackendState | null): RecipeBackendState["actions"][number] | null {
+    if (!next) return null;
+    return next.actions.find((info) => info.action === "download_llamacpp_q8_model") || null;
+  }
+
+  function backendActionsWithoutSpecialDownloads(next: RecipeBackendState | null): RecipeBackendState["actions"] {
     if (!next) return [];
-    return next.actions.filter((info) => info.action !== "download_hf_model");
+    return next.actions.filter((info) => info.action !== "download_hf_model" && info.action !== "download_llamacpp_q8_model");
   }
 
   function runningLabel(action: string): string {
@@ -166,6 +173,8 @@
         return "Updating llama.cpp image...";
       case "download_hf_model":
         return "Downloading HF model...";
+      case "download_llamacpp_q8_model":
+        return "Downloading Qwen3 Q8_0...";
       default:
         return "Running...";
     }
@@ -197,7 +206,7 @@
         actionOutput = next.output;
       }
 
-      if (previous?.running && !next.running && next.action === "download_hf_model") {
+      if (previous?.running && !next.running && (next.action === "download_hf_model" || next.action === "download_llamacpp_q8_model")) {
         await refreshHFModels(signal);
         if (next.state === "success") {
           notice = `Descarga completada en ${formatDuration(next.durationMs || 0)}.`;
@@ -324,9 +333,9 @@
   }
 
   async function runAction(action: string, label: string): Promise<void> {
-    const isDownload = action === "download_hf_model";
+    const isDownload = action === "download_hf_model" || action === "download_llamacpp_q8_model";
     if (!isDownload && actionRunning) return;
-    if (isDownload && isBackendActionRunning("download_hf_model")) {
+    if (isDownload && (isBackendActionRunning("download_hf_model") || isBackendActionRunning("download_llamacpp_q8_model"))) {
       error = "Ya hay una descarga en progreso. Espera a que termine.";
       return;
     }
@@ -660,6 +669,32 @@
           </div>
         {/if}
 
+        {#if llamacppQuickDownloadAction(state)}
+          <div class="mb-3 p-3 border border-card-border rounded bg-background/40 space-y-2">
+            <div class="text-sm text-txtsecondary">Descarga rápida llama.cpp (1 nodo)</div>
+            <div class="text-xs text-txtsecondary break-all">
+              Modelo:
+              <span class="font-mono">{llamacppQuickModel}</span>
+              | cuantización:
+              <span class="font-mono">{llamacppQuickQuant}</span>
+            </div>
+            <button
+              class="btn btn--sm"
+              onclick={() => runAction("download_llamacpp_q8_model", llamacppQuickDownloadAction(state)?.label || "Download Qwen3 Next Q8_0 (1 node)")}
+              disabled={isBackendActionRunning("download_hf_model") || isBackendActionRunning("download_llamacpp_q8_model") || saving || !!deletingHFModel}
+              title={llamacppQuickDownloadAction(state)?.commandHint || "Download Qwen3 Next Q8_0 (1 node)"}
+            >
+              {isBackendActionRunning("download_llamacpp_q8_model")
+                ? runningLabel("download_llamacpp_q8_model")
+                : (llamacppQuickDownloadAction(state)?.label || "Download Qwen3 Next Q8_0 (1 node)")}
+            </button>
+            <div class="text-xs text-txtsecondary break-all">
+              Command:
+              <span class="font-mono">{llamacppQuickDownloadAction(state)?.commandHint || "proxy/scripts/llamacpp-hf-download.sh <model> --include *Q8_0*.gguf"}</span>
+            </div>
+          </div>
+        {/if}
+
         <div class="mb-3 p-3 border border-card-border rounded bg-background/40 space-y-2">
           <div class="text-sm text-txtsecondary">Modelos descargados (Hugging Face)</div>
           <div class="text-xs text-txtsecondary break-all">
@@ -693,13 +728,13 @@
           {/if}
         </div>
 
-        {#if backendActionsWithoutHF(state).length === 0}
-          {#if !hfDownloadAction(state)}
+        {#if backendActionsWithoutSpecialDownloads(state).length === 0}
+          {#if !hfDownloadAction(state) && !llamacppQuickDownloadAction(state)}
             <div class="text-xs text-txtsecondary">No hay acciones disponibles para este backend.</div>
           {/if}
         {:else}
           <div class="flex flex-wrap gap-2">
-            {#each backendActionsWithoutHF(state) as info (info.action + info.label)}
+            {#each backendActionsWithoutSpecialDownloads(state) as info (info.action + info.label)}
               <button
                 class="btn btn--sm"
                 onclick={() => runAction(info.action, info.label)}

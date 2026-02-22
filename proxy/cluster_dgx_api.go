@@ -481,16 +481,6 @@ func parseDBusIntStringResult(raw string) (int, string, error) {
 	return 0, "", fmt.Errorf("unexpected format: %s", first)
 }
 
-func firstNonEmptyLine(raw string) string {
-	for _, line := range strings.Split(raw, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
-
 func uniqueNonEmptyStrings(items []string) []string {
 	out := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))

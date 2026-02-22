@@ -23,6 +23,9 @@ type Model struct {
 	Unlisted       bool   `json:"unlisted"`
 	PeerID         string `json:"peerID"`
 	ContainerImage string `json:"containerImage,omitempty"`
+	RecipeRef      string `json:"recipeRef,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	TensorParallel int    `json:"tensorParallel,omitempty"`
 }
 
 func addApiHandlers(pm *ProxyManager) {
@@ -62,6 +65,7 @@ func addApiHandlers(pm *ProxyManager) {
 func (pm *ProxyManager) apiUnloadAllModels(c *gin.Context) {
 	pm.StopProcesses(StopImmediately)
 	pm.stopVLLMServeFallback()
+	pm.stopLLAMACPPServeFallback()
 	c.JSON(http.StatusOK, gin.H{"msg": "ok"})
 }
 
@@ -75,7 +79,37 @@ func (pm *ProxyManager) stopVLLMServeFallback() {
 	if len(containers) == 0 {
 		containers = []string{"vllm_node"}
 	}
+	pm.stopFallbackProcessInContainers(containers, "vllm serve", "vllm serve")
+}
 
+func (pm *ProxyManager) stopLLAMACPPServeFallback() {
+	// Similar to vLLM fallback handling: ensure orphan llama.cpp servers do not
+	// survive across proxy restarts and block clean model unloads/reloads.
+	pm.stopFallbackProcessOnHost("llama-server", "llama.cpp server")
+}
+
+func (pm *ProxyManager) stopFallbackProcessOnHost(processPattern, processLabel string) {
+	cmd := exec.Command("pkill", "-f", processPattern)
+	output, execErr := cmd.CombinedOutput()
+	if execErr != nil {
+		if exitErr, ok := execErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return
+		}
+		pm.proxyLogger.Warnf(
+			"fallback stop of %s failed err=%v output=%s",
+			processLabel,
+			execErr,
+			strings.TrimSpace(string(output)),
+		)
+		return
+	}
+
+	if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+		pm.proxyLogger.Infof("fallback stop of %s output=%s", processLabel, trimmed)
+	}
+}
+
+func (pm *ProxyManager) stopFallbackProcessInContainers(containers []string, processPattern, processLabel string) {
 	seen := make(map[string]struct{}, len(containers))
 	for _, container := range containers {
 		container = strings.TrimSpace(container)
@@ -87,18 +121,18 @@ func (pm *ProxyManager) stopVLLMServeFallback() {
 		}
 		seen[container] = struct{}{}
 
-		cmd := exec.Command("docker", "exec", container, "bash", "-lc", `pkill -f "vllm serve"`)
+		cmd := exec.Command("docker", "exec", container, "pkill", "-f", processPattern)
 		output, execErr := cmd.CombinedOutput()
 		if execErr != nil {
 			if exitErr, ok := execErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 				continue
 			}
-			pm.proxyLogger.Warnf("fallback stop of vllm serve failed container=%s err=%v output=%s", container, execErr, strings.TrimSpace(string(output)))
+			pm.proxyLogger.Warnf("fallback stop of %s failed container=%s err=%v output=%s", processLabel, container, execErr, strings.TrimSpace(string(output)))
 			continue
 		}
 
 		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
-			pm.proxyLogger.Infof("fallback stop of vllm serve container=%s output=%s", container, trimmed)
+			pm.proxyLogger.Infof("fallback stop of %s container=%s output=%s", processLabel, container, trimmed)
 		}
 	}
 }
@@ -109,8 +143,16 @@ func detectVLLMFallbackContainers() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker ps failed: %w", err)
 	}
+	return parseFallbackContainersFromDockerPS(string(output), "vllm"), nil
+}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+func parseFallbackContainersFromDockerPS(output, matchToken string) []string {
+	matchToken = strings.ToLower(strings.TrimSpace(matchToken))
+	if matchToken == "" {
+		return nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
 	containers := make([]string, 0, len(lines))
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -128,12 +170,12 @@ func detectVLLMFallbackContainers() ([]string, error) {
 		if len(parts) > 1 {
 			image = strings.ToLower(strings.TrimSpace(parts[1]))
 		}
-		if strings.Contains(strings.ToLower(name), "vllm") || strings.Contains(image, "vllm") {
+		if strings.Contains(strings.ToLower(name), matchToken) || strings.Contains(image, matchToken) {
 			containers = append(containers, name)
 		}
 	}
 
-	return containers, nil
+	return containers
 }
 
 func normalizeContainerImage(value any) string {
@@ -259,15 +301,16 @@ func (pm *ProxyManager) getModelStatus() []Model {
 		if !recipeEntryTargetsActiveBackend(modelCfg.Metadata, activeBackendDir) {
 			continue
 		}
-		if rm, isRecipe := toRecipeManagedModel(modelID, map[string]any{
+		recipeModel, isRecipe := toRecipeManagedModel(modelID, map[string]any{
 			"cmd":      modelCfg.Cmd,
 			"metadata": modelCfg.Metadata,
-		}, nil); isRecipe && !recipeManagedModelInCatalog(rm, catalogByID) {
+		}, nil)
+		if isRecipe && !recipeManagedModelInCatalog(recipeModel, catalogByID) {
 			continue
 		}
 
 		// Get process state
-		state := "unknown"
+		state := string(StateStopped)
 		processGroup := pm.findGroupByModelName(modelID)
 		if processGroup != nil {
 			process := processGroup.processes[modelID]
@@ -276,17 +319,24 @@ func (pm *ProxyManager) getModelStatus() []Model {
 			}
 		}
 
-		idx := len(models)
-		models = append(models, Model{
+		modelStatus := Model{
 			Id:             modelID,
 			Name:           modelCfg.Name,
 			Description:    modelCfg.Description,
 			State:          state,
 			Unlisted:       modelCfg.Unlisted,
 			ContainerImage: resolveModelContainerImage(modelID, modelCfg.Cmd, modelCfg.Metadata, catalogByID, defaultContainerImage),
-		})
+		}
+		if isRecipe {
+			modelStatus.RecipeRef = recipeModel.RecipeRef
+			modelStatus.Mode = recipeModel.Mode
+			modelStatus.TensorParallel = recipeModel.TensorParallel
+		}
 
-		if state == string(StateStopped) || state == "unknown" {
+		idx := len(models)
+		models = append(models, modelStatus)
+
+		if state == string(StateStopped) {
 			candidates = append(candidates, probeCandidate{
 				index: idx,
 				proxy: modelCfg.Proxy,

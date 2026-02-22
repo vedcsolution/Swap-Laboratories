@@ -8,9 +8,6 @@
     startBenchy,
     getBenchyJob,
     cancelBenchyJob,
-    getDockerContainers,
-    getRecipeUIState,
-    upsertRecipeModel,
   } from "../stores/api";
   import { isNarrow } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
@@ -25,14 +22,6 @@
   let showRecipeManager = $state(false);
   let bulkActionError: string | null = $state(null);
   let bulkActionNotice: string | null = $state(null);
-  const fallbackContainers = [
-    "vllm-next:latest",
-    "vllm-node:latest",
-    "vllm-node-12.0f:latest",
-    "vllm-node-mxfp4:latest",
-  ];
-  let availableContainers = $state<string[]>(fallbackContainers);
-
   const showUnlistedStore = persistentStore<boolean>("showUnlisted", true);
   const showIdorNameStore = persistentStore<"id" | "name">("showIdorName", "id");
 
@@ -80,19 +69,8 @@
     }
   }
 
-  async function loadAvailableContainers(): Promise<void> {
-    try {
-      const containers = await getDockerContainers();
-      availableContainers = containers.length > 0 ? containers : fallbackContainers;
-    } catch (error) {
-      console.error("Failed to load containers:", error);
-      availableContainers = fallbackContainers;
-    }
-  }
-
   onMount(() => {
     document.addEventListener('click', handleClickOutside);
-    void loadAvailableContainers();
   });
 
   onDestroy(() => {
@@ -248,45 +226,6 @@
     }
   }
 
-  async function updateModelContainer(modelId: string, container: string): Promise<void> {
-    try {
-      // Get current recipe state for this model
-      const state = await getRecipeUIState();
-      const modelRecipe = state.models.find(m => m.modelId === modelId);
-
-      if (!modelRecipe) {
-        throw new Error(`Model ${modelId} is not a recipe-managed model`);
-      }
-
-      // Update the model with the new container
-      await upsertRecipeModel({
-        modelId,
-        recipeRef: modelRecipe.recipeRef,
-        name: modelRecipe.name,
-        description: modelRecipe.description,
-        aliases: modelRecipe.aliases,
-        useModelName: modelRecipe.useModelName,
-        mode: modelRecipe.mode,
-        tensorParallel: modelRecipe.tensorParallel,
-        nodes: modelRecipe.nodes,
-        extraArgs: modelRecipe.extraArgs,
-        group: modelRecipe.group,
-        unlisted: modelRecipe.unlisted,
-        containerImage: container,
-        nonPrivileged: modelRecipe.nonPrivileged,
-        memLimitGb: modelRecipe.memLimitGb,
-        memSwapLimitGb: modelRecipe.memSwapLimitGb,
-        pidsLimit: modelRecipe.pidsLimit,
-        shmSizeGb: modelRecipe.shmSizeGb,
-      });
-
-      // Show success feedback
-      return;
-    } catch (error) {
-      console.error('Failed to update container:', error);
-      throw error;
-    }
-  }
 </script>
 
 <div class="card h-full flex flex-col">

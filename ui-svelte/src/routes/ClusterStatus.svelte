@@ -4,14 +4,14 @@
   import type { ClusterStatusState } from "../lib/types";
   import { collapseHomePath } from "../lib/pathDisplay";
 
-  let loading = $state(true);
-  let refreshing = $state(false);
-  let dgxUpdating = $state(false);
-  let dgxUpdatingTargets = $state<Record<string, boolean>>({});
-  let error = $state<string | null>(null);
-  let dgxActionError = $state<string | null>(null);
-  let dgxActionResult = $state<string | null>(null);
-  let state = $state<ClusterStatusState | null>(null);
+  let loading = true;
+  let refreshing = false;
+  let dgxUpdating = false;
+  let dgxUpdatingTargets: Record<string, boolean> = {};
+  let error: string | null = null;
+  let dgxActionError: string | null = null;
+  let dgxActionResult: string | null = null;
+  let state: ClusterStatusState | null = null;
   let refreshController: AbortController | null = null;
 
   function formatTime(value?: string): string {
